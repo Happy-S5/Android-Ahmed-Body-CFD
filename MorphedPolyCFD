@@ -1,0 +1,2989 @@
+# ============================================================
+# 3D AHMED BODY CFD
+# SECTIONAL POLYGON + GEODESIC SWEPT-TRIANGLE BOUNDARY UPGRADE
+# HYPERBOLIC/TVD ADVECTION + TANH CLUSTERED GRID + LIVE CONSOLE FILE
+# Android / Pydroid / Workstation Python
+#
+# Hyperbolic upgrades added:
+#   - Hyperbolic-tangent / sech^2 clustered grid option
+#   - Nonuniform-grid central derivatives
+#   - Nonuniform-grid Poisson Jacobi pressure solve
+#   - Conservative TVD MUSCL/van-Leer advection fluxes
+#   - Optional pseudo-compressibility pressure preconditioning hook
+#   - Live console tee file that updates during the run
+#
+# Features retained:
+#   - Required OBJ import from Download/AhmedGeometry
+#   - No procedural/generated body fallback
+#   - Sectional polygon volume integration
+#   - Voxel immersed-body CFD mask
+#   - Geodesic arc-length boundary resampling
+#   - Swept boundary triangles
+#   - Corner likelihood
+#   - Rear/wake likelihood
+#   - Recursive Euler-identity wake-eddy refinement
+#   - Wake eddy-viscosity reduction
+#   - Geodesic pressure-force diagnostic
+#   - Normal-driven morphed swept shell diagnostic
+#   - Morphed pressure-force sensitivity estimate
+#   - Real-Re RANS/DDES-style projection CFD option
+#   - Legacy DNS-like labels retained only as optional experiments
+#   - CSV, TXT, PNG, NPZ output
+#
+# Put optional OBJ in:
+#   Internal storage/Download/AhmedGeometry/
+# named:
+#   Ahmed_Body.obj
+#   Ahmed Body.obj
+#   ahmed_body.obj
+#   ahmed body.obj
+#
+# Outputs to:
+#   Internal storage/Download/AhmedGeometry/
+# ============================================================
+
+import os
+import sys
+import csv
+import math
+import time
+import traceback
+from pathlib import Path
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    from scipy.ndimage import distance_transform_cdt
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
+
+
+# ============================================================
+# 1. RUN MODE
+# ============================================================
+
+
+def _arg_value(name, default=None):
+    """Tiny CLI helper so run mode can be chosen before CFG is built."""
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    prefix = name + "="
+    for a in sys.argv[1:]:
+        if a.startswith(prefix):
+            return a.split("=", 1)[1]
+    return default
+
+RUN_MODE = _arg_value("--run-mode", os.environ.get("AHMED_RUN_MODE", "ANDROID_SECTIONAL_GEODESIC_DDES"))
+
+MODES = {
+    # Android-safe DNS-like mode:
+    #   - no modeled eddy viscosity, nu_eff = molecular nu only
+    #   - recursive Euler eddies are used once as tiny initial perturbations
+    #   - wake_likelihood remains a diagnostic/refinement map, not a force/nu_t modifier
+    #   - REAL-PHYSICS VERSION: Re is NOT lowered; air viscosity is kept at Re_L ~= 2.68e6
+    "ANDROID_DNS_LIKE_EULER_WAKE": dict(
+        nx=112, ny=44, nz=40,
+        num_steps=900,
+        poisson_iters=70,
+        log_every=25,
+        cfl_target=0.16,
+        n_sections=144,
+        geodesic_points=56,
+        tanh_grid=True,
+        tvd_advection=True,
+        dns_like=False,
+        dns_target_re_l=None,
+        dns_initial_perturbation=True,
+        dns_perturbation_epsilon=0.004,
+        dns_max_perturbation_eddies=80,
+    ),
+    "ANDROID_FAST_DNS_LIKE_EULER_WAKE": dict(
+        nx=88, ny=36, nz=34,
+        num_steps=520,
+        poisson_iters=55,
+        log_every=20,
+        cfl_target=0.15,
+        n_sections=110,
+        geodesic_points=44,
+        tanh_grid=True,
+        tvd_advection=True,
+        dns_like=False,
+        dns_target_re_l=None,
+        dns_initial_perturbation=True,
+        dns_perturbation_epsilon=0.004,
+        dns_max_perturbation_eddies=48,
+    ),
+    "SMOKE_TEST_3D_OBJ": dict(
+        nx=36, ny=18, nz=16,
+        num_steps=2,
+        poisson_iters=4,
+        log_every=1,
+        cfl_target=0.10,
+        n_sections=40,
+        geodesic_points=16,
+        tanh_grid=True,
+        tvd_advection=True,
+        dns_like=False,
+        dns_target_re_l=None,
+        dns_initial_perturbation=False,
+        dns_perturbation_epsilon=0.0,
+        dns_max_perturbation_eddies=0,
+    ),
+    "ANDROID_FAST_GEODESIC_DDES": dict(
+        nx=104, ny=40, nz=40,
+        num_steps=700,
+        poisson_iters=45,
+        log_every=25,
+        cfl_target=0.26,
+        n_sections=120,
+        geodesic_points=48,
+        tanh_grid=True,
+        tvd_advection=True,
+    ),
+    "ANDROID_SECTIONAL_GEODESIC_DDES": dict(
+        nx=128, ny=48, nz=44,
+        num_steps=1200,
+        poisson_iters=180,
+        log_every=25,
+        cfl_target=0.26,
+        n_sections=160,
+        geodesic_points=64,
+        tanh_grid=True,
+        tvd_advection=True,
+    ),
+    "WORKSTATION_GEODESIC_DDES": dict(
+        nx=320, ny=128, nz=96,
+        num_steps=3200,
+        poisson_iters=180,
+        log_every=25,
+        cfl_target=0.26,
+        n_sections=2600,
+        geodesic_points=128,
+        tanh_grid=True,
+        tvd_advection=True,
+    ),
+}
+
+
+if RUN_MODE not in MODES:
+    raise ValueError(f"Unknown RUN_MODE {RUN_MODE!r}. Valid modes: {sorted(MODES)}")
+CFG = MODES[RUN_MODE]
+
+
+# ============================================================
+# 2. OUTPUT SETUP + LIVE CONSOLE TEE
+# ============================================================
+
+def get_output_dir():
+    candidates = [
+        Path("/storage/emulated/0/Download/AhmedGeometry"),
+        Path("/sdcard/Download/AhmedGeometry"),
+        Path.home() / "Downloads" / "AhmedGeometry",
+        Path.cwd() / "AhmedGeometry",
+    ]
+    for p in candidates:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            test = p / "_write_test.tmp"
+            test.write_text("ok")
+            test.unlink()
+            return p
+        except Exception:
+            pass
+    p = Path.cwd() / "AhmedGeometry"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+OUTPUT_DIR = get_output_dir()
+
+LOG_PATH = OUTPUT_DIR / "ahmed_geodesic_hyperbolic_cfd_log.txt"
+LIVE_CONSOLE_PATH = OUTPUT_DIR / "ahmed_geodesic_live_console.txt"
+HYPERBOLIC_NOTES_TXT = OUTPUT_DIR / "ahmed_hyperbolic_upgrade_notes.txt"
+HISTORY_CSV = OUTPUT_DIR / "ahmed_geodesic_hyperbolic_force_history.csv"
+HISTORY_READABLE_TXT = OUTPUT_DIR / "ahmed_3d_cd_cl_history_readable.txt"
+FORCE_READABLE_PNG = OUTPUT_DIR / "ahmed_3d_cd_cl_history.png"
+SUMMARY_TXT = OUTPUT_DIR / "ahmed_geodesic_hyperbolic_summary.txt"
+GEODESIC_TRI_CSV = OUTPUT_DIR / "ahmed_geodesic_boundary_triangles.csv"
+MORPHED_TRI_CSV = OUTPUT_DIR / "ahmed_morphed_normal_boundary_triangles.csv"
+MORPHED_ANALYSIS_TXT = OUTPUT_DIR / "ahmed_morphed_normal_shell_analysis.txt"
+EULER_WAKE_EDDY_CSV = OUTPUT_DIR / "ahmed_recursive_euler_wake_eddies.csv"
+EULER_WAKE_ANALYSIS_TXT = OUTPUT_DIR / "ahmed_recursive_euler_wake_analysis.txt"
+DNS_LIKE_ANALYSIS_TXT = OUTPUT_DIR / "ahmed_dns_like_solver_analysis.txt"
+FIELDS_NPZ = OUTPUT_DIR / "ahmed_geodesic_hyperbolic_final_fields.npz"
+CONV_PNG = OUTPUT_DIR / "ahmed_geodesic_hyperbolic_convergence.png"
+FIELD_PNG = OUTPUT_DIR / "ahmed_geodesic_hyperbolic_field_slices.png"
+STREAMLINE_PNG = OUTPUT_DIR / "ahmed_dns_like_streamlines.png"
+
+class TeeWriter:
+    """Mirror stdout/stderr to a live-updating text file."""
+    def __init__(self, terminal, file_path):
+        self.terminal = terminal
+        self.file = open(file_path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.file.write(message)
+        self.flush()
+
+    def flush(self):
+        try:
+            self.terminal.flush()
+        except Exception:
+            pass
+        try:
+            self.file.flush()
+            os.fsync(self.file.fileno())
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.file.close()
+        except Exception:
+            pass
+
+# Start a fresh live console file every run, then tee all print/errors to it.
+LIVE_CONSOLE_PATH.write_text("=== LIVE CONSOLE OUTPUT ===\n", encoding="utf-8")
+sys.stdout = TeeWriter(sys.__stdout__, LIVE_CONSOLE_PATH)
+sys.stderr = TeeWriter(sys.__stderr__, LIVE_CONSOLE_PATH)
+
+with open(LOG_PATH, "w", encoding="utf-8") as f:
+    f.write("=== AHMED GEODESIC HYPERBOLIC SECTIONAL CFD LOG ===\n\n")
+
+
+def log(msg):
+    """Console + persistent run log. Both files update as the run proceeds."""
+    print(msg, flush=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(str(msg) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+HYPERBOLIC_NOTES_TXT.write_text(
+    "=== HYPERBOLIC CFD UPGRADE NOTES ===\n"
+    "1. Conservative TVD MUSCL/van-Leer advection is used when CFG['tvd_advection']=True.\n"
+    "2. Hyperbolic-tangent/sech^2 grid clustering is used when CFG['tanh_grid']=True.\n"
+    "3. The grid clusters points near the front face, rear slant/base, near wake, side edges, ground, and roof.\n"
+    "4. Pressure projection now uses a nonuniform-grid Jacobi Poisson update.\n"
+    "5. The live console is mirrored to ahmed_geodesic_live_console.txt throughout the run.\n"
+    "6. Pseudo-compressibility is included as an optional disabled hook; leave it off until tuned.\n"
+    "7. Recursive Euler wake refinement uses exp(i theta)=cos(theta)+i sin(theta) to spawn child eddy centers in the wake.\n"
+    "8. Real-physics mode keeps Re_L ~= 2.68e6; use RANS/DDES modes because the grid is not DNS-resolved.\n"
+    "9. A dedicated streamline PNG is written to ahmed_dns_like_streamlines.png using side and top velocity slices.\n"
+    "10. Normal-driven morphing can build a diagnostic shell X_tilde = X + alpha n for boundary/wake/pressure sensitivity.\n",
+    encoding="utf-8"
+)
+
+
+# ============================================================
+# 3. PHYSICAL CONSTANTS
+# ============================================================
+
+RHO = 1.18393
+U_INF = 40.0
+
+BODY_L = 1.044
+BODY_W = 0.389
+BODY_H = 0.288
+SLANT_LEN = 0.222
+SLANT_ANGLE_DEG = 25.0
+SLANT_ANGLE = math.radians(SLANT_ANGLE_DEG)
+
+# Real Ahmed-body benchmark physics.  Do not lower Re for Android.
+# With rho=1.18393 kg/m^3, U=40 m/s, and L=1.044 m, this gives
+# mu ~= 1.84481e-5 Pa s and nu ~= 1.55821e-5 m^2/s.
+TARGET_RE_L = 2.68e6
+MU = RHO * U_INF * BODY_L / TARGET_RE_L
+NU = MU / RHO
+A_REF = BODY_W * BODY_H
+RE_L = RHO * U_INF * BODY_L / MU
+Q_INF = 0.5 * RHO * U_INF * U_INF
+
+# Legacy DNS-like flags are retained for experiments, but the real-physics
+# version never changes viscosity to force a lower Reynolds number.  At Re~2.68e6,
+# Android grids are not DNS; use RANS/DDES modes for physically sensible runs.
+DNS_LIKE_MODE = bool(CFG.get("dns_like", False))
+DNS_TARGET_RE_L = CFG.get("dns_target_re_l", None)
+RE_L_AIR_ORIGINAL = RE_L
+MU_AIR_ORIGINAL = MU
+NU_AIR_ORIGINAL = NU
+if DNS_LIKE_MODE and DNS_TARGET_RE_L is not None:
+    print("WARNING: dns_target_re_l is ignored in the real-physics script; Re_L remains 2.68e6.", flush=True)
+
+
+UPSTREAM_L = 2.00 * BODY_L  # benchmark-oriented inlet distance
+DOWNSTREAM_L = 5.00 * BODY_L
+
+DOMAIN_X = UPSTREAM_L + BODY_L + DOWNSTREAM_L
+DOMAIN_Y = 4.80 * BODY_W
+DOMAIN_Z = 1.40
+
+BODY_X0 = UPSTREAM_L
+BODY_X1 = BODY_X0 + BODY_L
+
+KAPPA = 0.41
+MIXING_LIMIT = 0.040
+NU_T_MAX = 1.0e-2
+NU_T_RELAX = 0.12
+
+
+# ============================================================
+# 4. GEODESIC + HYPERBOLIC PARAMETERS
+# ============================================================
+
+USE_OBJ_INPUT = True
+USE_GEODESIC_BOUNDARY_TRIANGLES = True
+USE_GEODESIC_WAKE_LIKELIHOOD = True
+USE_GEODESIC_PRESSURE_FORCE = True
+
+# Normal-driven morphed polygon/swept-shell philosophy.  This is an
+# Android-safe geometry-aware diagnostic layer, not a replacement for the flow
+# solver.  It implements q_tilde = q + alpha N and Delta V ~= sum(alpha_i A_i).
+USE_MORPHED_NORMAL_SHELL = True
+USE_MORPHED_SHELL_IN_GRID_FIELDS = True
+USE_MORPHED_PRESSURE_SENSITIVITY = True
+MORPH_EPSILON = 0.012                 # shell amplitude as a fraction of body length
+MORPH_MAX_FRACTION_BODY_L = 0.020     # hard safety cap to reduce self-intersection risk
+MORPH_MIN_ALPHA = 0.0                 # outward-only diagnostic shell by default
+MORPH_CORNER_GAIN = 0.35
+MORPH_WAKE_GAIN = 0.40
+MORPH_DOWNSTREAM_NORMAL_GAIN = 0.20
+MORPH_REAR_CAP_GAIN = 0.35
+MORPH_FRONT_CAP_GAIN = 0.05
+MORPH_WEIGHT_CORNER = 0.65
+MORPH_WEIGHT_WAKE = 0.85
+MORPH_WEIGHT_PRESSURE_NORMAL = 0.35
+MORPH_ROUND_DECIMALS = 11
+
+GEODESIC_POINTS_PER_SECTION = CFG["geodesic_points"]
+GEODESIC_MAX_WAKE_SEEDS = 180
+GEODESIC_WAKE_LENGTH_BODY = 3.5
+GEODESIC_WAKE_SPREAD0 = 0.035
+GEODESIC_WAKE_SPREAD_SLOPE = 0.10
+GEODESIC_WAKE_DECAY_BODY = 1.20
+GEODESIC_CORNER_RADIUS_CELLS = 2
+GEODESIC_BOUNDARY_RADIUS_CELLS = 1
+
+GEODESIC_WAKE_REDUCE_NUT = not DNS_LIKE_MODE
+GEODESIC_WAKE_NUT_REDUCTION = 0.35
+
+# Recursive Euler wake refinement. This does not claim DNS turbulence; it
+# adds a geometry-aware, multiscale wake-likelihood refinement before nu_t use.
+USE_RECURSIVE_EULER_WAKE_REFINEMENT = True
+EULER_WAKE_MAX_DEPTH = 4                 # Android-safe: 3 to 5
+EULER_WAKE_MAX_ROOTS = 36                # strongest geodesic wake seeds
+EULER_WAKE_CHILDREN_PER_EDDY = 2
+EULER_WAKE_RADIUS_SCALE = 0.58
+EULER_WAKE_BRANCH_ANGLE_DEG = 52.0
+EULER_WAKE_DOWNSTREAM_STEP = 1.35
+EULER_WAKE_SPIRAL_TURNS = 1.15
+EULER_WAKE_PHASE_GAIN = 7.5
+EULER_WAKE_AMPLITUDE_SCALE = 0.42
+EULER_WAKE_MIN_RADIUS_CELLS = 1.20
+EULER_WAKE_MAX_FIELD_EDDIES = 420
+EULER_WAKE_BLEND = 0.55                  # 0=old smooth wake, 1=max recursive refinement
+EULER_WAKE_ACTIVE_THRESHOLD = 0.05
+
+# DNS-like settings. In DNS-like mode, recursive Euler eddies are only a
+# one-time small initial perturbation and diagnostic map. They are not injected
+# as a source term every step, and they do not modify nu_t because nu_t=0.
+USE_DNS_LIKE_MODE = DNS_LIKE_MODE
+USE_DNS_INITIAL_EULER_PERTURBATION = bool(CFG.get("dns_initial_perturbation", USE_DNS_LIKE_MODE))
+DNS_PERTURBATION_EPSILON = float(CFG.get("dns_perturbation_epsilon", 0.004))
+DNS_MAX_PERTURBATION_EDDIES = int(CFG.get("dns_max_perturbation_eddies", 64))
+DNS_PROJECT_INITIAL_PERTURBATION = True
+
+USE_HYPERBOLIC_TANH_GRID = bool(CFG.get("tanh_grid", True))
+USE_TVD_HYPERBOLIC_ADVECTION = bool(CFG.get("tvd_advection", True))
+TVD_LIMITER = "vanleer"  # "vanleer" or "minmod"
+
+# Optional experimental pressure preconditioner. Disabled by default because
+# poorly tuned artificial-compressibility pressure 
+#ation can destabilize
+# incompressible projection CFD.
+USE_PSEUDO_COMPRESSIBILITY_PRECONDITIONER = True
+PSEUDO_BETA = 0.25 * U_INF
+PSEUDO_RELAX = 0.02
+
+
+# ============================================================
+# 5. BASIC GEOMETRY UTILITIES
+# ============================================================
+
+def _safe_norm(v, eps=1.0e-15):
+    return float(np.sqrt(np.dot(v, v)) + eps)
+
+
+def smoothstep(edge0, edge1, x):
+    if edge1 == edge0:
+        return np.zeros_like(x, dtype=float)
+    t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def polygon_signed_area_yz(poly):
+    p = np.asarray(poly, dtype=float)
+    y = p[:, 0]
+    z = p[:, 1]
+    return 0.5 * np.sum(y * np.roll(z, -1) - np.roll(y, -1) * z)
+
+
+def polygon_area_centroid_yz(poly):
+    p = np.asarray(poly, dtype=float)
+    if len(p) < 3:
+        return 0.0, 0.0, 0.0
+
+    y = p[:, 0]
+    z = p[:, 1]
+    y2 = np.roll(y, -1)
+    z2 = np.roll(z, -1)
+    cross = y * z2 - y2 * z
+    A_signed = 0.5 * np.sum(cross)
+    A = abs(A_signed)
+
+    if A < 1.0e-15:
+        return 0.0, float(np.mean(y)), float(np.mean(z))
+
+    cy = np.sum((y + y2) * cross) / (6.0 * A_signed)
+    cz = np.sum((z + z2) * cross) / (6.0 * A_signed)
+    return A, float(cy), float(cz)
+
+
+def convex_hull_2d(points):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 3:
+        return pts
+
+    pts = np.unique(np.round(pts, 12), axis=0)
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper = []
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = np.asarray(lower[:-1] + upper[:-1], dtype=float)
+    return hull
+
+
+def points_in_polygon_yz(Y, Z, poly):
+    poly = np.asarray(poly, dtype=float)
+    yv = poly[:, 0]
+    zv = poly[:, 1]
+
+    inside = np.zeros_like(Y, dtype=bool)
+    j = len(poly) - 1
+
+    for i in range(len(poly)):
+        yi, zi = yv[i], zv[i]
+        yj, zj = yv[j], zv[j]
+
+        intersects = ((zi > Z) != (zj > Z)) & (
+            Y < (yj - yi) * (Z - zi) / ((zj - zi) + 1.0e-30) + yi
+        )
+        inside ^= intersects
+        j = i
+
+    return inside
+
+
+# ============================================================
+# 6. HYPERBOLIC-TANGENT / SECH^2 GRID UTILITIES
+# ============================================================
+
+def sech2(x):
+    x = np.clip(x, -40.0, 40.0)
+    c = np.cosh(x)
+    return 1.0 / (c * c)
+
+
+def clustered_axis_sech2(xmin, xmax, n, centers, strengths, widths, samples=12000):
+    """
+    Create a monotone nonuniform axis by sampling a density field.
+    Higher density means smaller local spacing. The density bumps are sech^2,
+    the derivative of tanh, so this implements hyperbolic-tangent-style clustering.
+    """
+    if n < 3:
+        return np.linspace(xmin, xmax, n)
+
+    s = np.linspace(xmin, xmax, samples)
+    density = np.ones_like(s)
+
+    for c, a, w in zip(centers, strengths, widths):
+        w = max(float(w), 1.0e-9)
+        density += float(a) * sech2((s - float(c)) / w)
+
+    density = np.maximum(density, 1.0e-6)
+    cumulative = np.zeros_like(s)
+    cumulative[1:] = np.cumsum(0.5 * (density[1:] + density[:-1]) * np.diff(s))
+    cumulative /= max(cumulative[-1], 1.0e-30)
+
+    target = np.linspace(0.0, 1.0, n)
+    axis = np.interp(target, cumulative, s)
+    axis[0] = xmin
+    axis[-1] = xmax
+    return axis
+
+
+def cell_widths(coords):
+    c = np.asarray(coords, dtype=float)
+    w = np.empty_like(c)
+    w[0] = c[1] - c[0]
+    w[-1] = c[-1] - c[-2]
+    w[1:-1] = 0.5 * (c[2:] - c[:-2])
+    return np.maximum(w, 1.0e-30)
+
+
+def min_grid_spacing(xg, yg, zg):
+    return float(min(np.min(np.diff(xg)), np.min(np.diff(yg)), np.min(np.diff(zg))))
+
+
+# ============================================================
+# 7. OBJ IMPORT AND SECTION GENERATION
+# ============================================================
+
+def find_obj_file():
+    """Find a real Ahmed OBJ. This 3D version has no procedural fallback."""
+    names = [
+        "Ahmed_Body.obj",
+        "Ahmed Body.obj",
+        "ahmed_body.obj",
+        "ahmed body.obj",
+        "AhmedGeometry.obj",
+        "AhmedGeomtry.obj",
+    ]
+    folders = [
+        OUTPUT_DIR,
+        Path("/storage/emulated/0/Download/AhmedGeometry"),
+        Path("/sdcard/Download/AhmedGeometry"),
+        Path.home() / "Downloads" / "AhmedGeometry",
+        Path.cwd(),
+        Path("/mnt/data"),
+    ]
+    for folder in folders:
+        for name in names:
+            p = folder / name
+            if p.exists():
+                return p
+    for folder in folders:
+        try:
+            objs = sorted(folder.glob("*.obj"))
+        except Exception:
+            objs = []
+        if objs:
+            return objs[0]
+    return None
+
+
+def load_obj_triangles(path):
+    vertices = []
+    faces = []
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("v "):
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif line.startswith("f "):
+                parts = line.strip().split()[1:]
+                idxs = []
+                for part in parts:
+                    raw = part.split("/")[0]
+                    if not raw:
+                        continue
+                    idx = int(raw)
+                    if idx < 0:
+                        idx = len(vertices) + idx
+                    else:
+                        idx = idx - 1
+                    idxs.append(idx)
+
+                if len(idxs) >= 3:
+                    for k in range(1, len(idxs) - 1):
+                        faces.append([idxs[0], idxs[k], idxs[k + 1]])
+
+    v = np.asarray(vertices, dtype=float)
+    f = np.asarray(faces, dtype=int)
+    return v, f
+
+
+def auto_orient_scale_obj_vertices(vertices):
+    """
+    Auto-orient by extents:
+      longest axis -> x
+      second       -> y
+      third        -> z
+    Then scale to Ahmed dimensions and place in CFD domain.
+    """
+    v = np.asarray(vertices, dtype=float)
+    mins = np.min(v, axis=0)
+    maxs = np.max(v, axis=0)
+    ext = maxs - mins
+
+    order = np.argsort(ext)[::-1]
+    w = v[:, order].copy()
+
+    mins = np.min(w, axis=0)
+    maxs = np.max(w, axis=0)
+    ext = np.maximum(maxs - mins, 1.0e-12)
+
+    out = np.zeros_like(w)
+    out[:, 0] = BODY_X0 + (w[:, 0] - mins[0]) / ext[0] * BODY_L
+    out[:, 1] = ((w[:, 1] - mins[1]) / ext[1] - 0.5) * BODY_W
+    out[:, 2] = (w[:, 2] - mins[2]) / ext[2] * BODY_H
+
+    return out
+
+
+def triangle_xplane_intersection_yz(tri, xp):
+    pts = []
+    for a, b in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]:
+        x1 = a[0]
+        x2 = b[0]
+
+        if abs(x1 - xp) < 1.0e-12 and abs(x2 - xp) < 1.0e-12:
+            continue
+
+        if (x1 - xp) * (x2 - xp) <= 0.0 and abs(x2 - x1) > 1.0e-15:
+            t = (xp - x1) / (x2 - x1)
+            if -1.0e-12 <= t <= 1.0 + 1.0e-12:
+                p = a + t * (b - a)
+                pts.append([p[1], p[2]])
+
+    if len(pts) < 2:
+        return []
+
+    pts = np.asarray(pts, dtype=float)
+    pts = np.unique(np.round(pts, 12), axis=0)
+
+    if len(pts) < 2:
+        return []
+
+    return pts.tolist()
+
+
+def make_sections_from_obj(vertices, faces, n_sections):
+    verts = auto_orient_scale_obj_vertices(vertices)
+    xs = np.linspace(BODY_X0, BODY_X1, n_sections)
+
+    triangles = verts[faces]
+    section_x = []
+    section_polys = []
+
+    for xp in xs:
+        pts = []
+        for tri in triangles:
+            seg = triangle_xplane_intersection_yz(tri, xp)
+            pts.extend(seg)
+
+        if len(pts) >= 3:
+            hull = convex_hull_2d(pts)
+            A, cy, cz = polygon_area_centroid_yz(hull)
+            if A > 1.0e-8:
+                section_x.append(xp)
+                section_polys.append(hull)
+
+    if len(section_x) < 8:
+        raise RuntimeError("OBJ slicing produced too few valid sections.")
+
+    return np.asarray(section_x), section_polys
+
+
+def procedural_ahmed_polygon_at_x(x):
+    """Simple Ahmed-like swept cross-section."""
+    slant_dx = SLANT_LEN * math.cos(SLANT_ANGLE)
+    slant_start = BODY_X1 - slant_dx
+
+    if x <= slant_start:
+        h = BODY_H
+    else:
+        drop = math.tan(SLANT_ANGLE) * (x - slant_start)
+        h = max(BODY_H - drop, 0.52 * BODY_H)
+
+    y0 = -0.5 * BODY_W
+    y1 = 0.5 * BODY_W
+    z0 = 0.0
+    z1 = h
+
+    return np.asarray([
+        [y0, z0],
+        [y1, z0],
+        [y1, z1],
+        [y0, z1],
+    ], dtype=float)
+
+
+def make_procedural_sections(n_sections):
+    xs = np.linspace(BODY_X0, BODY_X1, n_sections)
+    polys = [procedural_ahmed_polygon_at_x(x) for x in xs]
+    return xs, polys
+
+
+def load_or_make_sections():
+    """Load only the OBJ mesh and slice it into 3D body sections.
+
+    There is intentionally no created/procedural Ahmed fallback here. If the OBJ
+    is missing or cannot be sliced, the solver stops so results cannot be
+    confused with generated geometry.
+    """
+    obj = find_obj_file()
+    if obj is None:
+        raise FileNotFoundError(
+            "No OBJ file found. Put Ahmed_Body.obj or AhmedGeometry.obj in "
+            "/storage/emulated/0/Download/AhmedGeometry or pass/run from a folder containing an .obj."
+        )
+    log(f"OBJ LOAD CONFIRMED: {obj}")
+    v, f = load_obj_triangles(obj)
+    if len(v) == 0 or len(f) == 0:
+        raise ValueError(f"OBJ file has no usable vertices/faces: {obj}")
+    log(f"OBJ vertices={len(v)}, triangles={len(f)}")
+    sx, sp = make_sections_from_obj(v, f, CFG["n_sections"])
+    log(f"OBJ sectional polygons created: {len(sx)}")
+    return sx, sp, f"OBJ imported and convex-sliced: {obj}"
+
+
+# ============================================================
+# 8. SECTIONAL METRICS
+# ============================================================
+
+def compute_sectional_metrics(section_x, section_polygons_yz):
+    xs = np.asarray(section_x, dtype=float)
+    areas = []
+    cys = []
+    czs = []
+
+    for p in section_polygons_yz:
+        A, cy, cz = polygon_area_centroid_yz(p)
+        areas.append(A)
+        cys.append(cy)
+        czs.append(cz)
+
+    areas = np.asarray(areas)
+    cys = np.asarray(cys)
+    czs = np.asarray(czs)
+
+    dxs = np.diff(xs)
+    vol_seg = 0.5 * (areas[:-1] + areas[1:]) * dxs
+    x_mid = 0.5 * (xs[:-1] + xs[1:])
+    cy_mid = 0.5 * (cys[:-1] + cys[1:])
+    cz_mid = 0.5 * (czs[:-1] + czs[1:])
+
+    V = float(np.sum(vol_seg))
+    xcg = float(np.sum(x_mid * vol_seg) / max(V, 1.0e-30))
+    ycg = float(np.sum(cy_mid * vol_seg) / max(V, 1.0e-30))
+    zcg = float(np.sum(cz_mid * vol_seg) / max(V, 1.0e-30))
+
+    return dict(
+        volume=V,
+        xcg=xcg,
+        ycg=ycg,
+        zcg=zcg,
+        section_area=areas,
+        section_cy=cys,
+        section_cz=czs,
+    )
+
+
+# ============================================================
+# 9. GEODESIC SWEPT-TRIANGLE BOUNDARY UPGRADE
+# ============================================================
+
+def resample_closed_polygon_by_arclength(poly, n_out):
+    p = np.asarray(poly, dtype=float)
+
+    if len(p) < 3:
+        raise ValueError("Need at least 3 polygon vertices.")
+
+    if np.linalg.norm(p[0] - p[-1]) < 1.0e-12:
+        p = p[:-1]
+
+    q = np.vstack([p, p[0]])
+    seg = q[1:] - q[:-1]
+    seg_len = np.sqrt(np.sum(seg * seg, axis=1))
+    perimeter = float(np.sum(seg_len))
+
+    if perimeter < 1.0e-15:
+        raise ValueError("Degenerate polygon perimeter.")
+
+    s_nodes = np.concatenate([[0.0], np.cumsum(seg_len)])
+    s_targets = np.linspace(0.0, perimeter, n_out, endpoint=False)
+
+    out = []
+    j = 0
+    for s in s_targets:
+        while j < len(seg_len) - 1 and s > s_nodes[j + 1]:
+            j += 1
+        ds = max(seg_len[j], 1.0e-15)
+        t = (s - s_nodes[j]) / ds
+        out.append(q[j] * (1.0 - t) + q[j + 1] * t)
+
+    return np.asarray(out, dtype=float)
+
+
+def original_vertex_corner_weights(poly):
+    p = np.asarray(poly, dtype=float)
+    n = len(p)
+    weights = np.zeros(n, dtype=float)
+
+    for i in range(n):
+        a = p[(i - 1) % n] - p[i]
+        b = p[(i + 1) % n] - p[i]
+        na = _safe_norm(a)
+        nb = _safe_norm(b)
+        c = np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0)
+        angle = math.acos(c)
+        weights[i] = np.clip((math.pi - angle) / (0.75 * math.pi), 0.0, 1.0)
+
+    return weights
+
+
+def resampled_corner_weights(poly_original, poly_resampled):
+    p0 = np.asarray(poly_original, dtype=float)
+    pr = np.asarray(poly_resampled, dtype=float)
+    cw0 = original_vertex_corner_weights(p0)
+
+    q = np.vstack([p0, p0[0]])
+    edge_len = np.sqrt(np.sum((q[1:] - q[:-1]) ** 2, axis=1))
+    radius = max(float(np.mean(edge_len)) * 0.25, 1.0e-8)
+
+    out = np.zeros(len(pr), dtype=float)
+    for j, pt in enumerate(pr):
+        d = np.sqrt(np.sum((p0 - pt) ** 2, axis=1))
+        influence = np.exp(-(d / radius) ** 2)
+        out[j] = float(np.max(cw0 * influence))
+
+    return np.clip(out, 0.0, 1.0)
+
+
+def triangle_area_normal(p0, p1, p2):
+    v1 = p1 - p0
+    v2 = p2 - p0
+    cr = np.cross(v1, v2)
+    mag = _safe_norm(cr)
+    area = 0.5 * mag
+    n = cr / mag
+    return float(area), n
+
+
+def build_swept_geodesic_boundary_triangles(section_x, section_polygons_yz,
+                                             n_per_section=64):
+    xs = np.asarray(section_x, dtype=float)
+    polys = [np.asarray(p, dtype=float) for p in section_polygons_yz]
+    ns = len(xs)
+
+    if ns < 2:
+        raise ValueError("Need at least two sectional stations.")
+
+    loops = []
+    loop_corner_w = []
+    areas = []
+    cys = []
+    czs = []
+
+    for poly in polys:
+        A, cy, cz = polygon_area_centroid_yz(poly)
+        loop = resample_closed_polygon_by_arclength(poly, n_per_section)
+        cw = resampled_corner_weights(poly, loop)
+
+        loops.append(loop)
+        loop_corner_w.append(cw)
+        areas.append(A)
+        cys.append(cy)
+        czs.append(cz)
+
+    areas = np.asarray(areas)
+    cys = np.asarray(cys)
+    czs = np.asarray(czs)
+
+    volume = float(np.sum(0.5 * (areas[:-1] + areas[1:]) * np.diff(xs)))
+
+    tri_p0 = []
+    tri_p1 = []
+    tri_p2 = []
+    tri_centroid = []
+    tri_normal = []
+    tri_area = []
+    tri_corner = []
+    tri_cap = []
+
+    for i in range(ns - 1):
+        x0 = xs[i]
+        x1 = xs[i + 1]
+        loop0 = loops[i]
+        loop1 = loops[i + 1]
+        cw0 = loop_corner_w[i]
+        cw1 = loop_corner_w[i + 1]
+
+        cy_mid = 0.5 * (cys[i] + cys[i + 1])
+        cz_mid = 0.5 * (czs[i] + czs[i + 1])
+        x_mid = 0.5 * (x0 + x1)
+        body_center = np.array([x_mid, cy_mid, cz_mid], dtype=float)
+
+        for j in range(n_per_section):
+            j2 = (j + 1) % n_per_section
+
+            a = np.array([x0, loop0[j, 0], loop0[j, 1]], dtype=float)
+            b = np.array([x0, loop0[j2, 0], loop0[j2, 1]], dtype=float)
+            c = np.array([x1, loop1[j2, 0], loop1[j2, 1]], dtype=float)
+            d = np.array([x1, loop1[j, 0], loop1[j, 1]], dtype=float)
+
+            candidates = [(a, d, c), (a, c, b)]
+
+            for pp0, pp1, pp2 in candidates:
+                ar, nn = triangle_area_normal(pp0, pp1, pp2)
+                cc = (pp0 + pp1 + pp2) / 3.0
+
+                outward = cc - body_center
+                if np.dot(nn, outward) < 0.0:
+                    pp1, pp2 = pp2.copy(), pp1.copy()
+                    ar, nn = triangle_area_normal(pp0, pp1, pp2)
+                    cc = (pp0 + pp1 + pp2) / 3.0
+
+                cw_tri = max(cw0[j], cw0[j2], cw1[j], cw1[j2])
+
+                tri_p0.append(pp0)
+                tri_p1.append(pp1)
+                tri_p2.append(pp2)
+                tri_centroid.append(cc)
+                tri_normal.append(nn)
+                tri_area.append(ar)
+                tri_corner.append(cw_tri)
+                tri_cap.append(0)
+
+    for cap_index, normal_sign in [(0, -1.0), (ns - 1, 1.0)]:
+        x = xs[cap_index]
+        loop = loops[cap_index]
+        cw = loop_corner_w[cap_index]
+        A, cy, cz = polygon_area_centroid_yz(loop)
+        center = np.array([x, cy, cz], dtype=float)
+
+        for j in range(n_per_section):
+            j2 = (j + 1) % n_per_section
+            a = np.array([x, loop[j, 0], loop[j, 1]], dtype=float)
+            b = np.array([x, loop[j2, 0], loop[j2, 1]], dtype=float)
+
+            if normal_sign < 0.0:
+                pp0, pp1, pp2 = center, b, a
+            else:
+                pp0, pp1, pp2 = center, a, b
+
+            ar, nn = triangle_area_normal(pp0, pp1, pp2)
+            cc = (pp0 + pp1 + pp2) / 3.0
+
+            target = np.array([normal_sign, 0.0, 0.0])
+            if np.dot(nn, target) < 0.0:
+                pp1, pp2 = pp2.copy(), pp1.copy()
+                ar, nn = triangle_area_normal(pp0, pp1, pp2)
+                cc = (pp0 + pp1 + pp2) / 3.0
+
+            tri_p0.append(pp0)
+            tri_p1.append(pp1)
+            tri_p2.append(pp2)
+            tri_centroid.append(cc)
+            tri_normal.append(nn)
+            tri_area.append(ar)
+            tri_corner.append(max(cw[j], cw[j2]))
+            tri_cap.append(1 if normal_sign < 0.0 else 2)
+
+    tri_p0 = np.asarray(tri_p0)
+    tri_p1 = np.asarray(tri_p1)
+    tri_p2 = np.asarray(tri_p2)
+    tri_centroid = np.asarray(tri_centroid)
+    tri_normal = np.asarray(tri_normal)
+    tri_area = np.asarray(tri_area)
+    tri_corner = np.asarray(tri_corner)
+    tri_cap = np.asarray(tri_cap)
+
+    x_min = float(np.min(xs))
+    x_max = float(np.max(xs))
+    L_body = max(x_max - x_min, 1.0e-12)
+
+    x_norm = (tri_centroid[:, 0] - x_min) / L_body
+    rear_weight = smoothstep(0.58, 1.00, x_norm)
+    downstream_normal = np.clip(tri_normal[:, 0], 0.0, 1.0)
+    corner_weight = tri_corner
+
+    rear_cap = (tri_cap == 2).astype(float)
+    front_cap = (tri_cap == 1).astype(float)
+
+    wake_seed = (
+        0.50 * rear_weight
+        + 0.35 * downstream_normal
+        + 0.45 * corner_weight
+        + 0.65 * rear_cap
+        + 0.10 * front_cap
+    )
+
+    wake_seed = np.clip(wake_seed, 0.0, 1.0)
+
+    return {
+        "x": xs,
+        "loops_yz": loops,
+        "section_area": areas,
+        "section_cy": cys,
+        "section_cz": czs,
+        "volume": volume,
+        "p0": tri_p0,
+        "p1": tri_p1,
+        "p2": tri_p2,
+        "centroid": tri_centroid,
+        "normal": tri_normal,
+        "area": tri_area,
+        "corner_weight": corner_weight,
+        "rear_weight": rear_weight,
+        "wake_seed": wake_seed,
+        "cap_flag": tri_cap,
+        "body_x_min": x_min,
+        "body_x_max": x_max,
+        "body_L": L_body,
+    }
+
+
+
+def _morph_vertex_key(pt, decimals=MORPH_ROUND_DECIMALS):
+    arr = np.round(np.asarray(pt, dtype=float), int(decimals))
+    return (float(arr[0]), float(arr[1]), float(arr[2]))
+
+
+def build_morphed_normal_shell(geo):
+    """
+    Build a normal-driven diagnostic shell from the geodesic swept-triangle
+    surface. This implements the morphed philosophy:
+        q_tilde = q + alpha_j N_j
+        Delta V ~= sum_i alpha_i A_i
+    where N_j is an area/importance-weighted vertex normal assembled from
+    adjacent triangle normals.
+    """
+    if geo is None:
+        return None, {"enabled": False, "reason": "no geodesic boundary"}
+
+    p0 = np.asarray(geo["p0"], dtype=float)
+    p1 = np.asarray(geo["p1"], dtype=float)
+    p2 = np.asarray(geo["p2"], dtype=float)
+    normals = np.asarray(geo["normal"], dtype=float)
+    areas = np.asarray(geo["area"], dtype=float)
+    corner = np.asarray(geo["corner_weight"], dtype=float)
+    wake = np.asarray(geo["wake_seed"], dtype=float)
+    cap = np.asarray(geo["cap_flag"], dtype=int)
+    L = float(max(geo.get("body_L", BODY_L), 1.0e-12))
+
+    downstream = np.clip(normals[:, 0], 0.0, 1.0)
+    rear_cap = (cap == 2).astype(float)
+    front_cap = (cap == 1).astype(float)
+
+    raw_importance = (
+        MORPH_CORNER_GAIN * corner
+        + MORPH_WAKE_GAIN * wake
+        + MORPH_DOWNSTREAM_NORMAL_GAIN * downstream
+        + MORPH_REAR_CAP_GAIN * rear_cap
+        + MORPH_FRONT_CAP_GAIN * front_cap
+    )
+    raw_importance = np.clip(raw_importance, 0.0, None)
+    norm_importance = raw_importance / max(float(np.max(raw_importance)), 1.0e-30)
+
+    alpha_tri = MORPH_EPSILON * L * norm_importance
+    alpha_cap = MORPH_MAX_FRACTION_BODY_L * L
+    alpha_tri = np.clip(alpha_tri, MORPH_MIN_ALPHA, alpha_cap)
+
+    tri_weight = areas * (
+        1.0
+        + MORPH_WEIGHT_CORNER * corner
+        + MORPH_WEIGHT_WAKE * wake
+        + MORPH_WEIGHT_PRESSURE_NORMAL * downstream
+    )
+    tri_weight = np.maximum(tri_weight, 1.0e-30)
+
+    accum_normal = {}
+    accum_alpha = {}
+    accum_weight = {}
+    for i in range(len(areas)):
+        for pt in (p0[i], p1[i], p2[i]):
+            key = _morph_vertex_key(pt)
+            if key not in accum_normal:
+                accum_normal[key] = np.zeros(3, dtype=float)
+                accum_alpha[key] = 0.0
+                accum_weight[key] = 0.0
+            accum_normal[key] += tri_weight[i] * normals[i]
+            accum_alpha[key] += tri_weight[i] * alpha_tri[i]
+            accum_weight[key] += tri_weight[i]
+
+    def morph_point(pt):
+        key = _morph_vertex_key(pt)
+        nn = accum_normal[key]
+        N = nn / _safe_norm(nn)
+        aa = accum_alpha[key] / max(accum_weight[key], 1.0e-30)
+        return np.asarray(pt, dtype=float) + aa * N, aa
+
+    mp0 = np.empty_like(p0)
+    mp1 = np.empty_like(p1)
+    mp2 = np.empty_like(p2)
+    v_alpha_sum = 0.0
+    v_count = 0
+    for i in range(len(areas)):
+        mp0[i], a0 = morph_point(p0[i])
+        mp1[i], a1 = morph_point(p1[i])
+        mp2[i], a2 = morph_point(p2[i])
+        v_alpha_sum += a0 + a1 + a2
+        v_count += 3
+
+    mor_area = np.zeros_like(areas)
+    mor_normal = np.zeros_like(normals)
+    mor_centroid = np.zeros_like(np.asarray(geo["centroid"], dtype=float))
+    for i in range(len(areas)):
+        ar, nn = triangle_area_normal(mp0[i], mp1[i], mp2[i])
+        if np.dot(nn, normals[i]) < 0.0:
+            mp1[i], mp2[i] = mp2[i].copy(), mp1[i].copy()
+            ar, nn = triangle_area_normal(mp0[i], mp1[i], mp2[i])
+        mor_area[i] = ar
+        mor_normal[i] = nn
+        mor_centroid[i] = (mp0[i] + mp1[i] + mp2[i]) / 3.0
+
+    shell_volume_first_order = float(np.sum(alpha_tri * areas))
+    morphed_area_sum = float(np.sum(mor_area))
+    base_area_sum = float(np.sum(areas))
+
+    normal_tensor = np.zeros((3, 3), dtype=float)
+    for ai, ni in zip(areas, normals):
+        normal_tensor += ai * np.outer(ni, ni)
+    evals, evecs = np.linalg.eigh(normal_tensor)
+    order = np.argsort(evals)[::-1]
+    evals = evals[order]
+    evecs = evecs[:, order]
+
+    morphed = dict(geo)
+    morphed.update({
+        "p0": mp0,
+        "p1": mp1,
+        "p2": mp2,
+        "centroid": mor_centroid,
+        "normal": mor_normal,
+        "area": mor_area,
+        "base_centroid": np.asarray(geo["centroid"], dtype=float),
+        "base_normal": normals,
+        "base_area": areas,
+        "morph_alpha": alpha_tri,
+        "morph_importance": norm_importance,
+        "shell_volume_first_order": shell_volume_first_order,
+        "volume": float(geo.get("volume", 0.0)) + shell_volume_first_order,
+        "normal_tensor": normal_tensor,
+        "normal_tensor_eigenvalues": evals,
+        "normal_tensor_eigenvectors": evecs,
+    })
+
+    metrics = {
+        "enabled": True,
+        "triangles": int(len(areas)),
+        "epsilon": float(MORPH_EPSILON),
+        "alpha_min": float(np.min(alpha_tri)) if len(alpha_tri) else 0.0,
+        "alpha_mean": float(np.mean(alpha_tri)) if len(alpha_tri) else 0.0,
+        "alpha_max": float(np.max(alpha_tri)) if len(alpha_tri) else 0.0,
+        "vertex_alpha_mean": float(v_alpha_sum / max(v_count, 1)),
+        "base_area_sum": base_area_sum,
+        "morphed_area_sum": morphed_area_sum,
+        "area_change_fraction": float((morphed_area_sum - base_area_sum) / max(base_area_sum, 1.0e-30)),
+        "base_volume": float(geo.get("volume", 0.0)),
+        "shell_volume_first_order": shell_volume_first_order,
+        "morphed_volume_first_order": float(geo.get("volume", 0.0)) + shell_volume_first_order,
+        "importance_mean": float(np.mean(norm_importance)) if len(norm_importance) else 0.0,
+        "importance_max": float(np.max(norm_importance)) if len(norm_importance) else 0.0,
+        "normal_tensor_eigenvalues": evals,
+        "dominant_normal_direction": evecs[:, 0],
+    }
+    return morphed, metrics
+
+
+def summarize_morphed_normal_shell(metrics):
+    lines = []
+    lines.append("=== NORMAL-DRIVEN MORPHED SWEPT SHELL SUMMARY ===")
+    lines.append(f"Enabled                       : {metrics.get('enabled', False)}")
+    if not metrics.get("enabled", False):
+        lines.append(f"Reason                        : {metrics.get('reason', 'unknown')}")
+        lines.append("=================================================")
+        return "\n".join(lines)
+    lines.append("Formula                       : q_tilde = q + alpha_j N_j")
+    lines.append("Volume estimate               : Delta V ~= sum_i alpha_i A_i")
+    lines.append(f"Triangles                     : {metrics['triangles']}")
+    lines.append(f"Morph epsilon                 : {metrics['epsilon']:.6e}")
+    lines.append(f"Alpha min/mean/max            : {metrics['alpha_min']:.9e} / {metrics['alpha_mean']:.9e} / {metrics['alpha_max']:.9e} m")
+    lines.append(f"Base surface area             : {metrics['base_area_sum']:.9e} m^2")
+    lines.append(f"Morphed surface area          : {metrics['morphed_area_sum']:.9e} m^2")
+    lines.append(f"Area change fraction          : {metrics['area_change_fraction']:.9e}")
+    lines.append(f"Base volume                   : {metrics['base_volume']:.9e} m^3")
+    lines.append(f"First-order shell volume      : {metrics['shell_volume_first_order']:.9e} m^3")
+    lines.append(f"Morphed volume estimate       : {metrics['morphed_volume_first_order']:.9e} m^3")
+    lines.append(f"Importance mean/max           : {metrics['importance_mean']:.9e} / {metrics['importance_max']:.9e}")
+    ev = metrics.get('normal_tensor_eigenvalues', np.zeros(3))
+    dn = metrics.get('dominant_normal_direction', np.zeros(3))
+    lines.append(f"Normal tensor eigenvalues     : {ev[0]:.9e}, {ev[1]:.9e}, {ev[2]:.9e}")
+    lines.append(f"Dominant normal direction     : [{dn[0]:+.6f}, {dn[1]:+.6f}, {dn[2]:+.6f}]")
+    lines.append("Use                           : boundary shell / wake shell / pressure sensitivity; not a replacement for Navier-Stokes")
+    lines.append("=================================================")
+    return "\n".join(lines)
+
+
+def write_morphed_normal_shell_txt(path, metrics):
+    Path(path).write_text(summarize_morphed_normal_shell(metrics) + "\n", encoding="utf-8")
+
+
+def write_morphed_boundary_csv(path, geo):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "tri_id", "cx", "cy", "cz", "nx", "ny", "nz", "area",
+            "base_cx", "base_cy", "base_cz", "base_nx", "base_ny", "base_nz", "base_area",
+            "morph_alpha", "morph_importance", "corner_weight", "rear_weight", "wake_seed", "cap_flag"
+        ])
+        for i in range(len(geo["area"])):
+            w.writerow([
+                i,
+                geo["centroid"][i, 0], geo["centroid"][i, 1], geo["centroid"][i, 2],
+                geo["normal"][i, 0], geo["normal"][i, 1], geo["normal"][i, 2], geo["area"][i],
+                geo["base_centroid"][i, 0], geo["base_centroid"][i, 1], geo["base_centroid"][i, 2],
+                geo["base_normal"][i, 0], geo["base_normal"][i, 1], geo["base_normal"][i, 2], geo["base_area"][i],
+                geo["morph_alpha"][i], geo["morph_importance"][i],
+                geo["corner_weight"][i], geo["rear_weight"][i], geo["wake_seed"][i], geo["cap_flag"][i],
+            ])
+
+def map_geodesic_boundary_to_grid(geo, xg, yg, zg, body_mask=None):
+    nx = len(xg)
+    ny = len(yg)
+    nz = len(zg)
+
+    boundary = np.zeros((nx, ny, nz), dtype=np.float32)
+    corner = np.zeros((nx, ny, nz), dtype=np.float32)
+    wake = np.zeros((nx, ny, nz), dtype=np.float32)
+
+    cent = geo["centroid"]
+    seed = geo["wake_seed"]
+    cweight = geo["corner_weight"]
+    x_min = geo["body_x_min"]
+    x_max = geo["body_x_max"]
+    L = geo["body_L"]
+
+    for m in range(len(cent)):
+        cx, cy, cz = cent[m]
+
+        ix = int(np.argmin(np.abs(xg - cx)))
+        iy = int(np.argmin(np.abs(yg - cy)))
+        iz = int(np.argmin(np.abs(zg - cz)))
+
+        rx_b = GEODESIC_BOUNDARY_RADIUS_CELLS
+        rx_c = GEODESIC_CORNER_RADIUS_CELLS
+
+        boundary[max(0, ix-rx_b):min(nx, ix+rx_b+1),
+                 max(0, iy-rx_b):min(ny, iy+rx_b+1),
+                 max(0, iz-rx_b):min(nz, iz+rx_b+1)] = 1.0
+
+        if cweight[m] > 0.05:
+            sub = corner[max(0, ix-rx_c):min(nx, ix+rx_c+1),
+                         max(0, iy-rx_c):min(ny, iy+rx_c+1),
+                         max(0, iz-rx_c):min(nz, iz+rx_c+1)]
+            np.maximum(sub, float(cweight[m]), out=sub)
+
+    order = np.argsort(seed)[::-1]
+    order = order[:min(GEODESIC_MAX_WAKE_SEEDS, len(order))]
+
+    X = xg[:, None, None]
+    Y = yg[None, :, None]
+    Z = zg[None, None, :]
+
+    wake_x_end = x_max + GEODESIC_WAKE_LENGTH_BODY * L
+
+    for m in order:
+        if seed[m] <= 0.05:
+            break
+
+        cx, cy, cz = cent[m]
+
+        if cx < x_min + 0.25 * L:
+            continue
+
+        dx = X - cx
+        downstream = (dx > 0.0) & (X <= wake_x_end)
+
+        spread = GEODESIC_WAKE_SPREAD0 + GEODESIC_WAKE_SPREAD_SLOPE * np.maximum(dx, 0.0)
+        spread2 = np.maximum(spread * spread, 1.0e-10)
+
+        radial2 = (Y - cy) ** 2 + (Z - cz) ** 2
+
+        wk = (
+            float(seed[m])
+            * np.exp(-radial2 / (2.0 * spread2))
+            * np.exp(-np.maximum(dx, 0.0) / max(GEODESIC_WAKE_DECAY_BODY * L, 1.0e-12))
+        )
+
+        wk = np.where(downstream, wk, 0.0)
+        wake = np.maximum(wake, wk.astype(np.float32))
+
+    if body_mask is not None:
+        wake = np.where(body_mask, 0.0, wake)
+
+    return boundary, corner, np.clip(wake, 0.0, 1.0)
+
+
+# ============================================================
+# 9B. RECURSIVE EULER WAKE-EDDY REFINEMENT
+# ============================================================
+
+def euler_unit(theta):
+    """
+    Euler identity in code:
+        exp(i theta) = cos(theta) + i sin(theta)
+    Returns a complex unit vector used for recursive eddy branching.
+    """
+    return np.exp(1j * theta)
+
+
+def _nearest_axis_index(axis, value):
+    return int(np.argmin(np.abs(np.asarray(axis) - float(value))))
+
+
+def write_recursive_euler_wake_csv(path, eddies):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "eddy_id", "parent_id", "root_seed", "depth",
+            "cx", "cy", "cz", "radius", "amplitude",
+            "phase", "theta_yz", "chirality"
+        ])
+        for e in eddies:
+            w.writerow([
+                e["id"], e["parent_id"], e["root_seed"], e["depth"],
+                e["center"][0], e["center"][1], e["center"][2],
+                e["radius"], e["amplitude"], e["phase"],
+                e["theta_yz"], e["chirality"],
+            ])
+
+
+def recursive_euler_wake_eddy_refinement(base_wake, geo, xg, yg, zg, body_mask=None):
+    """
+    Refines the smooth geodesic wake-likelihood field with recursive eddies.
+
+    What it does:
+      1. Uses the strongest geodesic wake seeds near the rear body.
+      2. Recursively spawns smaller child eddies downstream.
+      3. Uses Euler's identity, exp(i theta), to rotate each child in the y-z plane.
+      4. Adds bounded oscillatory eddy likelihood, then blends with the original wake.
+
+    Important:
+      This is a likelihood/closure refinement, not a DNS turbulence solver.
+    """
+    base = np.asarray(base_wake, dtype=np.float32)
+    refined_add = np.zeros_like(base, dtype=np.float32)
+    eddies = []
+
+    if (not USE_RECURSIVE_EULER_WAKE_REFINEMENT) or geo is None or np.max(base) <= 1.0e-12:
+        metrics = analyze_wake_likelihood_importance(base, base, body_mask, eddies)
+        return base, eddies, metrics
+
+    xg = np.asarray(xg, dtype=float)
+    yg = np.asarray(yg, dtype=float)
+    zg = np.asarray(zg, dtype=float)
+    hmin_local = min_grid_spacing(xg, yg, zg)
+
+    cent = np.asarray(geo["centroid"], dtype=float)
+    normals = np.asarray(geo["normal"], dtype=float)
+    seed = np.asarray(geo["wake_seed"], dtype=float)
+    x_min = float(geo["body_x_min"])
+    x_max = float(geo["body_x_max"])
+    L = float(max(geo["body_L"], 1.0e-12))
+
+    # Strongest rear/downstream-facing seeds become recursive eddy roots.
+    eligible = np.where((seed > 0.08) & (cent[:, 0] > x_min + 0.55 * L))[0]
+    if len(eligible) == 0:
+        eligible = np.where(seed > 0.08)[0]
+    order = eligible[np.argsort(seed[eligible])[::-1]] if len(eligible) else np.array([], dtype=int)
+    order = order[:min(EULER_WAKE_MAX_ROOTS, len(order))]
+
+    min_radius = max(EULER_WAKE_MIN_RADIUS_CELLS * hmin_local, 1.0e-5)
+    base_radius = max(0.18 * BODY_W, 2.5 * hmin_local)
+    branch_angle = math.radians(EULER_WAKE_BRANCH_ANGLE_DEG)
+
+    def spawn(center, radius, amp, phase, theta_yz, depth, parent_id, root_seed, chirality):
+        if len(eddies) >= EULER_WAKE_MAX_FIELD_EDDIES:
+            return
+        if depth > EULER_WAKE_MAX_DEPTH or radius < min_radius or amp < 0.012:
+            return
+        if center[0] < x_min or center[0] > x_max + GEODESIC_WAKE_LENGTH_BODY * L:
+            return
+
+        eddy_id = len(eddies)
+        eddies.append({
+            "id": eddy_id,
+            "parent_id": parent_id,
+            "root_seed": int(root_seed),
+            "depth": int(depth),
+            "center": np.asarray(center, dtype=float),
+            "radius": float(radius),
+            "amplitude": float(amp),
+            "phase": float(phase),
+            "theta_yz": float(theta_yz),
+            "chirality": float(chirality),
+        })
+
+        if depth == EULER_WAKE_MAX_DEPTH:
+            return
+
+        for sign in (-1.0, 1.0):
+            child_radius = radius * EULER_WAKE_RADIUS_SCALE
+            child_amp = amp * (0.78 - 0.055 * depth)
+            child_theta = theta_yz + sign * branch_angle + chirality * (0.35 + 0.10 * depth)
+
+            # Euler rotation in the cross-plane: y+i z shift = r exp(i theta).
+            yz_shift = child_radius * EULER_WAKE_DOWNSTREAM_STEP * euler_unit(child_theta)
+            child_center = np.array([
+                center[0] + EULER_WAKE_DOWNSTREAM_STEP * child_radius,
+                center[1] + float(np.real(yz_shift)),
+                center[2] + float(np.imag(yz_shift)),
+            ], dtype=float)
+
+            child_phase = phase + sign * 0.5 * math.pi + chirality * branch_angle
+            child_chirality = -chirality * sign
+
+            spawn(child_center, child_radius, child_amp, child_phase,
+                  child_theta, depth + 1, eddy_id, root_seed, child_chirality)
+
+    for root_count, m in enumerate(order):
+        cx, cy, cz = cent[m]
+        nvec = normals[m]
+
+        # Place the root just downstream of the surface seed.
+        sx = cx + 0.35 * base_radius + 0.12 * L * max(nvec[0], 0.0)
+        sy = cy
+        sz = cz
+
+        # Use normal direction where possible; otherwise split upper/lower branches.
+        theta_yz = math.atan2(nvec[2], nvec[1] + 1.0e-30)
+        if abs(nvec[1]) + abs(nvec[2]) < 1.0e-8:
+            theta_yz = (1.0 if (root_count % 2 == 0) else -1.0) * 0.5 * math.pi
+
+        local_radius = base_radius * (0.65 + 0.80 * float(seed[m]))
+        amp = EULER_WAKE_AMPLITUDE_SCALE * float(seed[m])
+        phase = root_count * 0.61803398875 * 2.0 * math.pi
+        chirality = 1.0 if (root_count % 2 == 0) else -1.0
+
+        spawn(np.array([sx, sy, sz], dtype=float), local_radius, amp,
+              phase, theta_yz, 0, -1, int(m), chirality)
+
+    # Deposit all recursive eddies onto the 3D grid.
+    X = xg[:, None, None]
+    Y = yg[None, :, None]
+    Z = zg[None, None, :]
+    wake_x_end = x_max + GEODESIC_WAKE_LENGTH_BODY * L
+
+    for e in eddies:
+        cx, cy, cz = e["center"]
+        r = max(e["radius"], min_radius)
+        amp = e["amplitude"]
+        phase = e["phase"]
+        chirality = e["chirality"]
+
+        dx = X - cx
+        downstream = (dx >= -0.15 * r) & (X <= wake_x_end)
+        radial2 = (Y - cy) ** 2 + (Z - cz) ** 2
+
+        theta = np.arctan2(Z - cz, Y - cy + 1.0e-30)
+        wave_phase = EULER_WAKE_PHASE_GAIN * dx / max(L, 1.0e-12) + chirality * theta + phase
+
+        # Bounded Euler/cosine likelihood: never injects negative likelihood.
+        oscillation = 0.55 + 0.45 * np.cos(wave_phase)
+        core = np.exp(-radial2 / (2.0 * max(r * r, 1.0e-12)))
+        downstream_decay = np.exp(-np.maximum(dx, 0.0) / max(GEODESIC_WAKE_DECAY_BODY * L, 1.0e-12))
+
+        wk = amp * oscillation * core * downstream_decay
+        wk = np.where(downstream, wk, 0.0)
+        refined_add = np.maximum(refined_add, wk.astype(np.float32))
+
+    if body_mask is not None:
+        refined_add = np.where(body_mask, 0.0, refined_add)
+
+    refined = np.maximum(base, EULER_WAKE_BLEND * refined_add + (1.0 - EULER_WAKE_BLEND) * base)
+    refined = np.clip(refined, 0.0, 1.0).astype(np.float32)
+
+    if body_mask is not None:
+        refined = np.where(body_mask, 0.0, refined)
+
+    metrics = analyze_wake_likelihood_importance(base, refined, body_mask, eddies)
+    return refined, eddies, metrics
+
+
+def analyze_wake_likelihood_importance(base_wake, refined_wake, body_mask, eddies):
+    """Quantifies whether wake likelihood materially changes the model."""
+    base = np.asarray(base_wake, dtype=float)
+    refined = np.asarray(refined_wake, dtype=float)
+
+    if body_mask is None:
+        fluid = np.ones_like(base, dtype=bool)
+    else:
+        fluid = ~body_mask
+
+    base_f = base[fluid]
+    refined_f = refined[fluid]
+    delta_f = np.maximum(refined_f - base_f, 0.0)
+
+    base_mean = float(np.mean(base_f)) if base_f.size else 0.0
+    base_max = float(np.max(base_f)) if base_f.size else 0.0
+    refined_mean = float(np.mean(refined_f)) if refined_f.size else 0.0
+    refined_max = float(np.max(refined_f)) if refined_f.size else 0.0
+    delta_mean = float(np.mean(delta_f)) if delta_f.size else 0.0
+    delta_max = float(np.max(delta_f)) if delta_f.size else 0.0
+
+    base_active = float(np.mean(base_f > EULER_WAKE_ACTIVE_THRESHOLD)) if base_f.size else 0.0
+    refined_active = float(np.mean(refined_f > EULER_WAKE_ACTIVE_THRESHOLD)) if refined_f.size else 0.0
+
+    # This is the direct mean fractional reduction applied to nu_t where enabled.
+    nut_reduction_mean = float(GEODESIC_WAKE_NUT_REDUCTION * refined_mean) if GEODESIC_WAKE_REDUCE_NUT else 0.0
+    nut_reduction_max = float(GEODESIC_WAKE_NUT_REDUCTION * refined_max) if GEODESIC_WAKE_REDUCE_NUT else 0.0
+
+    # Compact importance score for reporting. Thresholds are conservative for sparse 3D grids.
+    importance_score = (
+        0.35 * min(refined_max / 0.50, 1.0)
+        + 0.25 * min(refined_active / 0.010, 1.0)
+        + 0.25 * min(nut_reduction_max / 0.12, 1.0)
+        + 0.15 * min((delta_mean / max(base_mean, 1.0e-12)) / 0.25, 1.0)
+    )
+
+    if importance_score >= 0.60:
+        decision = "IMPORTANT"
+    elif importance_score >= 0.35:
+        decision = "MODERATELY IMPORTANT"
+    else:
+        decision = "WEAK / DIAGNOSTIC ONLY"
+
+    return {
+        "base_mean": base_mean,
+        "base_max": base_max,
+        "refined_mean": refined_mean,
+        "refined_max": refined_max,
+        "delta_mean": delta_mean,
+        "delta_max": delta_max,
+        "base_active_fraction": base_active,
+        "refined_active_fraction": refined_active,
+        "eddy_count": int(len(eddies)),
+        "nut_reduction_mean": nut_reduction_mean,
+        "nut_reduction_max": nut_reduction_max,
+        "importance_score": float(importance_score),
+        "decision": decision,
+    }
+
+
+def write_wake_analysis_txt(path, metrics):
+    lines = []
+    lines.append("=== RECURSIVE EULER WAKE-LIKELIHOOD ANALYSIS ===")
+    lines.append("Euler identity used: exp(i theta) = cos(theta) + i sin(theta)")
+    lines.append("Purpose: recursive multiscale wake-likelihood refinement, not DNS turbulence.")
+    lines.append("")
+    lines.append(f"Recursive Euler enabled      : {USE_RECURSIVE_EULER_WAKE_REFINEMENT}")
+    lines.append(f"Recursive eddy count         : {metrics.get('eddy_count', 0)}")
+    lines.append(f"Base wake mean               : {metrics.get('base_mean', 0.0):.9e}")
+    lines.append(f"Base wake max                : {metrics.get('base_max', 0.0):.9e}")
+    lines.append(f"Refined wake mean            : {metrics.get('refined_mean', 0.0):.9e}")
+    lines.append(f"Refined wake max             : {metrics.get('refined_max', 0.0):.9e}")
+    lines.append(f"Refinement delta mean        : {metrics.get('delta_mean', 0.0):.9e}")
+    lines.append(f"Refinement delta max         : {metrics.get('delta_max', 0.0):.9e}")
+    lines.append(f"Base active fraction         : {metrics.get('base_active_fraction', 0.0):.9e}")
+    lines.append(f"Refined active fraction      : {metrics.get('refined_active_fraction', 0.0):.9e}")
+    lines.append(f"Mean nu_t reduction fraction : {metrics.get('nut_reduction_mean', 0.0):.9e}")
+    lines.append(f"Max nu_t reduction fraction  : {metrics.get('nut_reduction_max', 0.0):.9e}")
+    lines.append(f"Wake importance score        : {metrics.get('importance_score', 0.0):.6f}")
+    lines.append(f"Decision                     : {metrics.get('decision', 'UNKNOWN')}")
+    lines.append("")
+    lines.append("Interpretation:")
+    lines.append("  Wake likelihood is important if it changes a nontrivial fluid volume or strongly reduces nu_t near the separated wake.")
+    lines.append("  It should remain a bounded correction, not a replacement for pressure projection, momentum transport, or benchmark validation.")
+    lines.append("==================================================")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+
+def apply_recursive_euler_dns_initial_perturbation(u, v, w, eddies, xg, yg, zg, body_mask):
+    """
+    DNS-like use of recursive Euler eddies.
+
+    This is a one-time, small, approximately divergence-free perturbation in
+    the y-z wake plane. It seeds instability, then the physical-viscosity
+    Navier-Stokes projection update must evolve or dissipate the structures.
+
+    It is not re-applied every step and it is not a force model.
+    """
+    metrics = {
+        "enabled": bool(USE_DNS_LIKE_MODE and USE_DNS_INITIAL_EULER_PERTURBATION),
+        "eddy_count_used": 0,
+        "epsilon_fraction": float(DNS_PERTURBATION_EPSILON),
+        "max_du": 0.0,
+        "max_dv": 0.0,
+        "max_dw": 0.0,
+        "l2_before_projection": 0.0,
+        "div_before_projection": 0.0,
+        "div_after_projection": 0.0,
+        "note": "disabled",
+    }
+
+    if not metrics["enabled"] or not eddies:
+        return u, v, w, metrics
+
+    selected = sorted(eddies, key=lambda e: e.get("amplitude", 0.0), reverse=True)
+    selected = selected[:min(DNS_MAX_PERTURBATION_EDDIES, len(selected))]
+
+    xg = np.asarray(xg, dtype=float)
+    yg = np.asarray(yg, dtype=float)
+    zg = np.asarray(zg, dtype=float)
+
+    X = xg[:, None, None]
+    Y = yg[None, :, None]
+    Z = zg[None, None, :]
+
+    du = np.zeros_like(u)
+    dv = np.zeros_like(v)
+    dw = np.zeros_like(w)
+
+    eps_vel = DNS_PERTURBATION_EPSILON * U_INF
+    L_decay = max(0.75 * BODY_L, 1.0e-12)
+
+    for e in selected:
+        cx, cy, cz = e["center"]
+        radius = max(float(e["radius"]), 2.0 * min_grid_spacing(xg, yg, zg))
+        amp = float(e.get("amplitude", 0.1))
+        chirality = float(e.get("chirality", 1.0))
+        phase = float(e.get("phase", 0.0))
+
+        dx = X - cx
+        dy = Y - cy
+        dz = Z - cz
+        r2 = dy * dy + dz * dz
+        core2 = max(radius * radius, 1.0e-12)
+
+        # Downstream-localized streamfunction amplitude.
+        stream_env = np.exp(-r2 / (2.0 * core2)) * np.exp(-np.maximum(dx, 0.0) / L_decay)
+        stream_env *= (dx > -0.25 * radius)
+
+        # Mild Euler phase modulation along x; this creates a wake wave seed.
+        theta = EULER_WAKE_PHASE_GAIN * dx / max(BODY_L, 1.0e-12) + phase
+        wave = 0.5 + 0.5 * np.cos(theta)
+        psi = chirality * eps_vel * amp * stream_env * wave
+
+        # y-z divergence-free perturbation from streamfunction psi:
+        #   v = d psi / dz, w = - d psi / dy approximately for Gaussian core.
+        # The signs produce counter-rotating child eddies without changing u much.
+        dv += -psi * dz / core2
+        dw +=  psi * dy / core2
+
+    # Clip the one-time perturbation so it remains a seed, not a forced solution.
+    clip_vel = max(DNS_PERTURBATION_EPSILON * U_INF, 1.0e-12)
+    du = np.clip(du, -clip_vel, clip_vel)
+    dv = np.clip(dv, -clip_vel, clip_vel)
+    dw = np.clip(dw, -clip_vel, clip_vel)
+
+    if body_mask is not None:
+        du[body_mask] = 0.0
+        dv[body_mask] = 0.0
+        dw[body_mask] = 0.0
+
+    u2 = u + du
+    v2 = v + dv
+    w2 = w + dw
+
+    metrics.update({
+        "eddy_count_used": int(len(selected)),
+        "max_du": float(np.max(np.abs(du))),
+        "max_dv": float(np.max(np.abs(dv))),
+        "max_dw": float(np.max(np.abs(dw))),
+        "l2_before_projection": float(np.sqrt(np.mean((du*du + dv*dv + dw*dw)[~body_mask]))) if body_mask is not None else float(np.sqrt(np.mean(du*du + dv*dv + dw*dw))),
+        "note": "one-time Euler recursive wake perturbation; not a recurring force",
+    })
+
+    return u2, v2, w2, metrics
+
+
+def write_dns_like_analysis_txt(path, dns_metrics, wake_metrics):
+    lines = []
+    lines.append("=== REAL-PHYSICS / TURBULENCE-MODE ANALYSIS ===")
+    lines.append(f"DNS-like mode                    : {USE_DNS_LIKE_MODE}")
+    lines.append(f"Run mode                         : {RUN_MODE}")
+    lines.append(f"Target real Re_L                 : {TARGET_RE_L:.9e}")
+    lines.append(f"Active/Recomputed Re_L           : {RE_L:.9e}")
+    lines.append(f"Real-physics mu                  : {MU:.9e} Pa s")
+    lines.append(f"Real-physics nu                  : {NU:.9e} m^2/s")
+    lines.append(f"Modeled eddy viscosity nu_t      : {'OFF / forced zero' if USE_DNS_LIKE_MODE else 'ON / RANS-DDES style'}")
+    lines.append(f"Wake modifies nu_t               : {GEODESIC_WAKE_REDUCE_NUT}")
+    lines.append(f"Euler perturbation enabled       : {dns_metrics.get('enabled', False)}")
+    lines.append(f"Euler perturbation epsilon       : {dns_metrics.get('epsilon_fraction', 0.0):.9e} * U_inf")
+    lines.append(f"Euler eddies used for init       : {dns_metrics.get('eddy_count_used', 0)}")
+    lines.append(f"Max perturbation du/dv/dw        : {dns_metrics.get('max_du', 0.0):.9e} / {dns_metrics.get('max_dv', 0.0):.9e} / {dns_metrics.get('max_dw', 0.0):.9e} m/s")
+    lines.append(f"Initial div before/after project : {dns_metrics.get('div_before_projection', 0.0):.9e} / {dns_metrics.get('div_after_projection', 0.0):.9e}")
+    lines.append(f"Wake diagnostic decision         : {wake_metrics.get('decision', 'UNKNOWN')}")
+    lines.append(f"Wake importance score            : {wake_metrics.get('importance_score', 0.0):.6f}")
+    lines.append("")
+    lines.append("Interpretation:")
+    lines.append("  This is DNS-like because it uses molecular viscosity only and no turbulence eddy-viscosity closure.")
+    lines.append("  It is not full high-Re Ahmed-body DNS. The Android grid is too coarse for Re~2.7e6.")
+    lines.append("  The optional target Reynolds number lowers the problem to a resolvable demonstration by increasing molecular viscosity.")
+    lines.append("  Recursive Euler child eddies are a one-time instability seed and diagnostic hierarchy, not an imposed turbulence solution.")
+    lines.append("  If child eddies persist after many steps, they are being evolved by the projection solver; if they vanish, the physical viscosity/grid dissipated them.")
+    lines.append("==================================================")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+def sample_scalar_nearest_grid(phi, xg, yg, zg, pts):
+    vals = np.zeros(len(pts), dtype=float)
+
+    for i, (x, y, z) in enumerate(pts):
+        ix = int(np.argmin(np.abs(xg - x)))
+        iy = int(np.argmin(np.abs(yg - y)))
+        iz = int(np.argmin(np.abs(zg - z)))
+        vals[i] = float(phi[ix, iy, iz])
+
+    return vals
+
+
+def geodesic_pressure_force_coefficients(p_gauge, geo, xg, yg, zg,
+                                          rho, U_inf, A_ref):
+    q_inf = 0.5 * rho * U_inf * U_inf
+
+    pts = geo["centroid"]
+    normals = geo["normal"]
+    areas = geo["area"]
+
+    ptri = sample_scalar_nearest_grid(p_gauge, xg, yg, zg, pts)
+    force = -np.sum((ptri * areas)[:, None] * normals, axis=0)
+
+    CD_geo = force[0] / max(q_inf * A_ref, 1.0e-30)
+    CS_geo = force[1] / max(q_inf * A_ref, 1.0e-30)
+    CL_geo = force[2] / max(q_inf * A_ref, 1.0e-30)
+
+    return float(CD_geo), float(CS_geo), float(CL_geo), force
+
+
+def write_geodesic_boundary_csv(path, geo):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "tri_id",
+            "cx", "cy", "cz",
+            "nx", "ny", "nz",
+            "area",
+            "corner_weight",
+            "rear_weight",
+            "wake_seed",
+            "cap_flag"
+        ])
+
+        c = geo["centroid"]
+        n = geo["normal"]
+        a = geo["area"]
+
+        for i in range(len(a)):
+            w.writerow([
+                i,
+                c[i, 0], c[i, 1], c[i, 2],
+                n[i, 0], n[i, 1], n[i, 2],
+                a[i],
+                geo["corner_weight"][i],
+                geo["rear_weight"][i],
+                geo["wake_seed"][i],
+                geo["cap_flag"][i],
+            ])
+
+
+def summarize_geodesic_boundary(geo):
+    msg = []
+    msg.append("=== GEODESIC SWEPT-TRIANGLE BOUNDARY SUMMARY ===")
+    msg.append(f"Boundary triangles          : {len(geo['area'])}")
+    msg.append(f"Geodesic sectional volume   : {geo['volume']:.9e} m^3")
+    msg.append(f"Surface triangle area sum   : {np.sum(geo['area']):.9e} m^2")
+    msg.append(f"Max corner weight           : {np.max(geo['corner_weight']):.6f}")
+    msg.append(f"Mean corner weight          : {np.mean(geo['corner_weight']):.6f}")
+    msg.append(f"Max wake seed               : {np.max(geo['wake_seed']):.6f}")
+    msg.append(f"Mean wake seed              : {np.mean(geo['wake_seed']):.6f}")
+    msg.append("=================================================")
+    return "\n".join(msg)
+
+
+# ============================================================
+# 10. GRID AND BODY MASK
+# ============================================================
+
+def make_grid():
+    nx = CFG["nx"]
+    ny = CFG["ny"]
+    nz = CFG["nz"]
+
+    if USE_HYPERBOLIC_TANH_GRID:
+        x_centers = [
+            BODY_X0,
+            BODY_X0 + 0.15 * BODY_L,
+            BODY_X1 - SLANT_LEN,
+            BODY_X1,
+            BODY_X1 + 0.55 * BODY_L,
+            BODY_X1 + 1.40 * BODY_L,
+        ]
+        x_strengths = [4.5, 1.5, 3.0, 5.0, 3.0, 1.5]
+        x_widths = [0.055 * BODY_L, 0.10 * BODY_L, 0.08 * BODY_L,
+                    0.075 * BODY_L, 0.25 * BODY_L, 0.45 * BODY_L]
+
+        y_centers = [-0.5 * BODY_W, 0.0, 0.5 * BODY_W]
+        y_strengths = [3.5, 1.2, 3.5]
+        y_widths = [0.06 * BODY_W, 0.45 * BODY_W, 0.06 * BODY_W]
+
+        z_centers = [0.0, 0.5 * BODY_H, BODY_H]
+        z_strengths = [6.0, 1.0, 3.0]
+        z_widths = [0.045, 0.12, 0.08]
+
+        xg = clustered_axis_sech2(0.0, DOMAIN_X, nx, x_centers, x_strengths, x_widths)
+        yg = clustered_axis_sech2(-0.5 * DOMAIN_Y, 0.5 * DOMAIN_Y, ny, y_centers, y_strengths, y_widths)
+        zg = clustered_axis_sech2(0.0, DOMAIN_Z, nz, z_centers, z_strengths, z_widths)
+    else:
+        xg = np.linspace(0.0, DOMAIN_X, nx)
+        yg = np.linspace(-0.5 * DOMAIN_Y, 0.5 * DOMAIN_Y, ny)
+        zg = np.linspace(0.0, DOMAIN_Z, nz)
+
+    dx_min = float(np.min(np.diff(xg)))
+    dy_min = float(np.min(np.diff(yg)))
+    dz_min = float(np.min(np.diff(zg)))
+
+    return xg, yg, zg, dx_min, dy_min, dz_min
+
+
+def make_body_mask_from_sections(xg, yg, zg, section_x, section_polys):
+    nx, ny, nz = len(xg), len(yg), len(zg)
+    body = np.zeros((nx, ny, nz), dtype=bool)
+
+    Y, Z = np.meshgrid(yg, zg, indexing="ij")
+
+    for ix, x in enumerate(xg):
+        if x < section_x[0] or x > section_x[-1]:
+            continue
+
+        j = int(np.argmin(np.abs(section_x - x)))
+        poly = section_polys[j]
+
+        inside_yz = points_in_polygon_yz(Y, Z, poly)
+        body[ix, :, :] = inside_yz
+
+    return body
+
+
+def compute_voxel_metrics(body_mask, xg, yg, zg):
+    wx = cell_widths(xg)
+    wy = cell_widths(yg)
+    wz = cell_widths(zg)
+
+    vol = wx[:, None, None] * wy[None, :, None] * wz[None, None, :]
+    masked_vol = np.where(body_mask, vol, 0.0)
+    V = float(np.sum(masked_vol))
+
+    idx = np.argwhere(body_mask)
+    n = len(idx)
+
+    if n == 0 or V <= 0.0:
+        return dict(volume=0.0, xcg=0.0, ycg=0.0, zcg=0.0, cells=0)
+
+    xcg = float(np.sum(masked_vol * xg[:, None, None]) / V)
+    ycg = float(np.sum(masked_vol * yg[None, :, None]) / V)
+    zcg = float(np.sum(masked_vol * zg[None, None, :]) / V)
+
+    return dict(volume=V, xcg=xcg, ycg=ycg, zcg=zcg, cells=int(n))
+
+
+# ============================================================
+# 11. CFD NUMERICS ON NONUNIFORM GRID
+# ============================================================
+
+def apply_boundary_conditions(u, v, w, p, body):
+    u[0, :, :] = U_INF
+    v[0, :, :] = 0.0
+    w[0, :, :] = 0.0
+
+    u[-1, :, :] = u[-2, :, :]
+    v[-1, :, :] = v[-2, :, :]
+    w[-1, :, :] = w[-2, :, :]
+    p[-1, :, :] = 0.0
+
+    u[:, 0, :] = u[:, 1, :]
+    v[:, 0, :] = 0.0
+    w[:, 0, :] = w[:, 1, :]
+    p[:, 0, :] = p[:, 1, :]
+
+    u[:, -1, :] = u[:, -2, :]
+    v[:, -1, :] = 0.0
+    w[:, -1, :] = w[:, -2, :]
+    p[:, -1, :] = p[:, -2, :]
+
+    # Ground no-slip
+    u[:, :, 0] = 0.0
+    v[:, :, 0] = 0.0
+    w[:, :, 0] = 0.0
+    p[:, :, 0] = p[:, :, 1]
+
+    # Top slip/freestream
+    u[:, :, -1] = u[:, :, -2]
+    v[:, :, -1] = v[:, :, -2]
+    w[:, :, -1] = 0.0
+    p[:, :, -1] = p[:, :, -2]
+
+    u[body] = 0.0
+    v[body] = 0.0
+    w[body] = 0.0
+
+    return u, v, w, p
+
+
+def dd_axis(phi, coords, axis):
+    """First derivative on nonuniform cell-centered coordinates."""
+    f = np.moveaxis(phi, axis, 0)
+    x = np.asarray(coords, dtype=float)
+    out = np.zeros_like(f)
+
+    hm = x[1:-1] - x[:-2]
+    hp = x[2:] - x[1:-1]
+    shape = (len(hm),) + (1,) * (f.ndim - 1)
+    hm_b = hm.reshape(shape)
+    hp_b = hp.reshape(shape)
+
+    out[1:-1] = (
+        hm_b * hm_b * (f[2:] - f[1:-1])
+        + hp_b * hp_b * (f[1:-1] - f[:-2])
+    ) / np.maximum(hm_b * hp_b * (hm_b + hp_b), 1.0e-30)
+
+    out[0] = (f[1] - f[0]) / max(x[1] - x[0], 1.0e-30)
+    out[-1] = (f[-1] - f[-2]) / max(x[-1] - x[-2], 1.0e-30)
+
+    return np.moveaxis(out, 0, axis)
+
+
+def second_axis(phi, coords, axis):
+    """Second derivative on nonuniform cell-centered coordinates."""
+    f = np.moveaxis(phi, axis, 0)
+    x = np.asarray(coords, dtype=float)
+    out = np.zeros_like(f)
+
+    hm = x[1:-1] - x[:-2]
+    hp = x[2:] - x[1:-1]
+    shape = (len(hm),) + (1,) * (f.ndim - 1)
+    hm_b = hm.reshape(shape)
+    hp_b = hp.reshape(shape)
+
+    out[1:-1] = 2.0 * (
+        (f[2:] - f[1:-1]) / np.maximum(hp_b, 1.0e-30)
+        - (f[1:-1] - f[:-2]) / np.maximum(hm_b, 1.0e-30)
+    ) / np.maximum(hm_b + hp_b, 1.0e-30)
+
+    out[0] = out[1]
+    out[-1] = out[-2]
+
+    return np.moveaxis(out, 0, axis)
+
+
+def laplacian(phi, xg, yg, zg):
+    return second_axis(phi, xg, 0) + second_axis(phi, yg, 1) + second_axis(phi, zg, 2)
+
+
+def divergence(u, v, w, xg, yg, zg):
+    return dd_axis(u, xg, 0) + dd_axis(v, yg, 1) + dd_axis(w, zg, 2)
+
+
+def limiter_slope(backward, forward, kind="vanleer"):
+    same = backward * forward > 0.0
+    if kind.lower() == "minmod":
+        return np.where(same, np.sign(backward) * np.minimum(np.abs(backward), np.abs(forward)), 0.0)
+    # Van Leer harmonic limiter
+    denom = backward + forward
+    val = np.where(np.abs(denom) > 1.0e-30, 2.0 * backward * forward / denom, 0.0)
+    return np.where(same, val, 0.0)
+
+
+def tvd_flux_derivative(phi, adv_vel, coords, axis, limiter=TVD_LIMITER):
+    """
+    Conservative MUSCL/TVD derivative d(adv_vel*phi)/dx on nonuniform grids.
+    This is the hyperbolic transport upgrade. For incompressible flow,
+    conservative and advective forms approach equivalence as divergence decreases.
+    """
+    f = np.moveaxis(phi, axis, 0)
+    a = np.moveaxis(adv_vel, axis, 0)
+    x = np.asarray(coords, dtype=float)
+    n = f.shape[0]
+
+    slopes = np.zeros_like(f)
+    dx_b = (x[1:-1] - x[:-2]).reshape((n - 2,) + (1,) * (f.ndim - 1))
+    dx_f = (x[2:] - x[1:-1]).reshape((n - 2,) + (1,) * (f.ndim - 1))
+    sb = (f[1:-1] - f[:-2]) / np.maximum(dx_b, 1.0e-30)
+    sf = (f[2:] - f[1:-1]) / np.maximum(dx_f, 1.0e-30)
+    slopes[1:-1] = limiter_slope(sb, sf, limiter)
+
+    flux = np.zeros((n + 1,) + f.shape[1:], dtype=f.dtype)
+
+    # Boundary face fluxes are first-order guarded.
+    flux[0] = a[0] * f[0]
+    flux[-1] = a[-1] * f[-1]
+
+    for k in range(1, n):
+        x_face = 0.5 * (x[k - 1] + x[k])
+        vel_face = 0.5 * (a[k - 1] + a[k])
+        left = f[k - 1] + slopes[k - 1] * (x_face - x[k - 1])
+        right = f[k] - slopes[k] * (x[k] - x_face)
+        flux[k] = np.where(vel_face >= 0.0, vel_face * left, vel_face * right)
+
+    widths = cell_widths(x).reshape((n,) + (1,) * (f.ndim - 1))
+    deriv = (flux[1:] - flux[:-1]) / np.maximum(widths, 1.0e-30)
+    return np.moveaxis(deriv, 0, axis)
+
+
+def upwind_deriv(phi, vel, coords, axis):
+    """Fallback first-order advective derivative on nonuniform grids."""
+    f = np.moveaxis(phi, axis, 0)
+    a = np.moveaxis(vel, axis, 0)
+    x = np.asarray(coords, dtype=float)
+    out = np.zeros_like(f)
+
+    dx_b = (x[1:] - x[:-1]).reshape((len(x) - 1,) + (1,) * (f.ndim - 1))
+    backward = np.zeros_like(f)
+    forward = np.zeros_like(f)
+
+    backward[1:] = (f[1:] - f[:-1]) / np.maximum(dx_b, 1.0e-30)
+    backward[0] = backward[1]
+
+    forward[:-1] = (f[1:] - f[:-1]) / np.maximum(dx_b, 1.0e-30)
+    forward[-1] = forward[-2]
+
+    out = np.where(a >= 0.0, backward, forward)
+    return np.moveaxis(out, 0, axis)
+
+
+def strain_magnitude(u, v, w, xg, yg, zg):
+    ux = dd_axis(u, xg, 0)
+    uy = dd_axis(u, yg, 1)
+    uz = dd_axis(u, zg, 2)
+
+    vx = dd_axis(v, xg, 0)
+    vy = dd_axis(v, yg, 1)
+    vz = dd_axis(v, zg, 2)
+
+    wx = dd_axis(w, xg, 0)
+    wy = dd_axis(w, yg, 1)
+    wz = dd_axis(w, zg, 2)
+
+    sxx = ux
+    syy = vy
+    szz = wz
+    sxy = 0.5 * (uy + vx)
+    sxz = 0.5 * (uz + wx)
+    syz = 0.5 * (vz + wy)
+
+    S2 = 2.0 * (sxx*sxx + syy*syy + szz*szz + 2.0*(sxy*sxy + sxz*sxz + syz*syz))
+    return np.sqrt(np.maximum(S2, 0.0))
+
+
+def pressure_poisson_nonuniform(p, rhs, xg, yg, zg, iters):
+    """Jacobi pressure Poisson update for a nonuniform Cartesian grid."""
+    x = np.asarray(xg)
+    y = np.asarray(yg)
+    z = np.asarray(zg)
+
+    hxm = x[1:-1] - x[:-2]
+    hxp = x[2:] - x[1:-1]
+    hym = y[1:-1] - y[:-2]
+    hyp = y[2:] - y[1:-1]
+    hzm = z[1:-1] - z[:-2]
+    hzp = z[2:] - z[1:-1]
+
+    cxm = (2.0 / np.maximum(hxm * (hxm + hxp), 1.0e-30))[:, None, None]
+    cxp = (2.0 / np.maximum(hxp * (hxm + hxp), 1.0e-30))[:, None, None]
+    cym = (2.0 / np.maximum(hym * (hym + hyp), 1.0e-30))[None, :, None]
+    cyp = (2.0 / np.maximum(hyp * (hym + hyp), 1.0e-30))[None, :, None]
+    czm = (2.0 / np.maximum(hzm * (hzm + hzp), 1.0e-30))[None, None, :]
+    czp = (2.0 / np.maximum(hzp * (hzm + hzp), 1.0e-30))[None, None, :]
+
+    denom = cxm + cxp + cym + cyp + czm + czp
+
+    for _ in range(iters):
+        pn = p.copy()
+        p[1:-1, 1:-1, 1:-1] = (
+            cxm * pn[:-2, 1:-1, 1:-1]
+            + cxp * pn[2:, 1:-1, 1:-1]
+            + cym * pn[1:-1, :-2, 1:-1]
+            + cyp * pn[1:-1, 2:, 1:-1]
+            + czm * pn[1:-1, 1:-1, :-2]
+            + czp * pn[1:-1, 1:-1, 2:]
+            - rhs[1:-1, 1:-1, 1:-1]
+        ) / np.maximum(denom, 1.0e-30)
+
+        p[0, :, :] = p[1, :, :]
+        p[-1, :, :] = 0.0
+        p[:, 0, :] = p[:, 1, :]
+        p[:, -1, :] = p[:, -2, :]
+        p[:, :, 0] = p[:, :, 1]
+        p[:, :, -1] = p[:, :, -2]
+
+    return p
+
+
+def pseudo_compressibility_preconditioner(p, div_star, dt, body):
+    if not USE_PSEUDO_COMPRESSIBILITY_PRECONDITIONER:
+        return p
+    p = p - PSEUDO_RELAX * RHO * PSEUDO_BETA * PSEUDO_BETA * dt * div_star
+    p[body] = 0.0
+    return p
+
+
+def compute_wall_distance(body_mask, min_spacing):
+    if SCIPY_OK:
+        fluid = ~body_mask
+        dist_cells = distance_transform_cdt(fluid, metric="taxicab").astype(float)
+        return dist_cells * min_spacing
+    return np.ones_like(body_mask, dtype=float) * min_spacing
+
+
+def wake_momentum_cd(u, xg, yg, zg, body_x1):
+    target_x = body_x1 + 0.75 * BODY_L
+    ix = int(np.argmin(np.abs(xg - target_x)))
+
+    U = np.maximum(u[ix, :, :], 0.0)
+    deficit = np.maximum(U_INF - U, 0.0)
+
+    wy = cell_widths(yg)
+    wz = cell_widths(zg)
+    dA = wy[:, None] * wz[None, :]
+
+    drag = np.sum(RHO * U * deficit * dA)
+    cd = drag / max(Q_INF * A_REF, 1.0e-30)
+    return float(cd)
+
+
+# ============================================================
+# 12. MAIN SOLVER
+# ============================================================
+
+def run_solver():
+    start_wall = time.time()
+
+    log(f"Run mode: {RUN_MODE}")
+    log(f"Output directory: {OUTPUT_DIR}")
+    log(f"Grid: {CFG['nx']} x {CFG['ny']} x {CFG['nz']}")
+    log(f"Steps: {CFG['num_steps']}")
+    log(f"Re_L = {RE_L:.6e}")
+    log(f"Real-physics target Re_L   : {TARGET_RE_L:.6e}")
+    log(f"Active/Recomputed Re_L     : {RE_L:.6e}")
+    log(f"Air viscosity active       : {MU:.6e} Pa s")
+    log(f"Kinematic viscosity active : {NU:.6e} m^2/s")
+    log(f"DNS-like legacy flag       : {USE_DNS_LIKE_MODE}")
+    if USE_DNS_LIKE_MODE:
+        log("WARNING: high-Re DNS-like mode is not physically resolved on this grid; RANS/DDES modes are recommended.")
+        log("Modeled eddy viscosity     : OFF (legacy experimental setting)")
+    else:
+        log("Modeled eddy viscosity     : ON (RANS/DDES-style mixing-length model)")
+    log(f"Hyperbolic tanh/sech2 grid : {USE_HYPERBOLIC_TANH_GRID}")
+    log(f"TVD hyperbolic advection   : {USE_TVD_HYPERBOLIC_ADVECTION} ({TVD_LIMITER})")
+    log(f"Live console file          : {LIVE_CONSOLE_PATH}")
+
+    section_x, section_polys, geometry_source = load_or_make_sections()
+    sec = compute_sectional_metrics(section_x, section_polys)
+
+    log("")
+    log("=== SECTIONAL GEOMETRY ===")
+    log(f"Geometry source       : {geometry_source}")
+    log(f"Sections              : {len(section_x)}")
+    log(f"Sectional volume      : {sec['volume']:.9e} m^3")
+    log(f"Sectional xcg         : {sec['xcg']:.9e} m")
+    log(f"Sectional ycg         : {sec['ycg']:.9e} m")
+    log(f"Sectional zcg         : {sec['zcg']:.9e} m")
+
+    geo_boundary = None
+
+    if USE_GEODESIC_BOUNDARY_TRIANGLES:
+        geo_boundary = build_swept_geodesic_boundary_triangles(
+            section_x=section_x,
+            section_polygons_yz=section_polys,
+            n_per_section=GEODESIC_POINTS_PER_SECTION
+        )
+
+        log("")
+        log(summarize_geodesic_boundary(geo_boundary))
+        write_geodesic_boundary_csv(GEODESIC_TRI_CSV, geo_boundary)
+
+    morphed_boundary = None
+    morphed_metrics = {"enabled": False, "reason": "disabled"}
+    if USE_MORPHED_NORMAL_SHELL and geo_boundary is not None:
+        morphed_boundary, morphed_metrics = build_morphed_normal_shell(geo_boundary)
+        write_morphed_normal_shell_txt(MORPHED_ANALYSIS_TXT, morphed_metrics)
+        if morphed_boundary is not None:
+            write_morphed_boundary_csv(MORPHED_TRI_CSV, morphed_boundary)
+        log("")
+        log(summarize_morphed_normal_shell(morphed_metrics))
+
+    xg, yg, zg, dx_min, dy_min, dz_min = make_grid()
+    hmin = min_grid_spacing(xg, yg, zg)
+
+    log("")
+    log("=== GRID METRICS ===")
+    log(f"x spacing min/max     : {np.min(np.diff(xg)):.6e} / {np.max(np.diff(xg)):.6e} m")
+    log(f"y spacing min/max     : {np.min(np.diff(yg)):.6e} / {np.max(np.diff(yg)):.6e} m")
+    log(f"z spacing min/max     : {np.min(np.diff(zg)):.6e} / {np.max(np.diff(zg)):.6e} m")
+    log(f"minimum spacing       : {hmin:.6e} m")
+
+    body = make_body_mask_from_sections(xg, yg, zg, section_x, section_polys)
+    vox = compute_voxel_metrics(body, xg, yg, zg)
+
+    vol_error = 100.0 * (vox["volume"] - sec["volume"]) / max(sec["volume"], 1.0e-30)
+
+    log("")
+    log("=== VOXEL GEOMETRY ===")
+    log(f"Voxel cells           : {vox['cells']}")
+    log(f"Voxel volume          : {vox['volume']:.9e} m^3")
+    log(f"Voxel volume error    : {vol_error:+.6f} %")
+    log(f"Voxel xcg             : {vox['xcg']:.9e} m")
+    log(f"Voxel ycg             : {vox['ycg']:.9e} m")
+    log(f"Voxel zcg             : {vox['zcg']:.9e} m")
+
+    if USE_GEODESIC_WAKE_LIKELIHOOD and geo_boundary is not None:
+        boundary_likelihood, corner_likelihood, wake_likelihood_base = map_geodesic_boundary_to_grid(
+            geo_boundary, xg, yg, zg, body_mask=body
+        )
+    else:
+        boundary_likelihood = np.zeros_like(body, dtype=np.float32)
+        corner_likelihood = np.zeros_like(body, dtype=np.float32)
+        wake_likelihood_base = np.zeros_like(body, dtype=np.float32)
+
+    morphed_boundary_likelihood = np.zeros_like(body, dtype=np.float32)
+    morphed_corner_likelihood = np.zeros_like(body, dtype=np.float32)
+    morphed_wake_likelihood_base = np.zeros_like(body, dtype=np.float32)
+    if USE_MORPHED_SHELL_IN_GRID_FIELDS and morphed_boundary is not None:
+        morphed_boundary_likelihood, morphed_corner_likelihood, morphed_wake_likelihood_base = map_geodesic_boundary_to_grid(
+            morphed_boundary, xg, yg, zg, body_mask=body
+        )
+        boundary_likelihood = np.maximum(boundary_likelihood, morphed_boundary_likelihood)
+        corner_likelihood = np.maximum(corner_likelihood, morphed_corner_likelihood)
+        wake_likelihood_base = np.maximum(wake_likelihood_base, morphed_wake_likelihood_base)
+
+    wake_likelihood, recursive_wake_eddies, wake_analysis = recursive_euler_wake_eddy_refinement(
+        wake_likelihood_base,
+        geo_boundary,
+        xg, yg, zg,
+        body_mask=body,
+    )
+    write_recursive_euler_wake_csv(EULER_WAKE_EDDY_CSV, recursive_wake_eddies)
+    write_wake_analysis_txt(EULER_WAKE_ANALYSIS_TXT, wake_analysis)
+
+    log("")
+    log("=== GEODESIC + RECURSIVE EULER WAKE FIELDS ===")
+    log(f"Boundary likelihood max : {float(np.max(boundary_likelihood)):.6f}")
+    log(f"Corner likelihood max   : {float(np.max(corner_likelihood)):.6f}")
+    if morphed_boundary is not None:
+        log(f"Morphed shell bnd max   : {float(np.max(morphed_boundary_likelihood)):.6f}")
+        log(f"Morphed shell wake max  : {float(np.max(morphed_wake_likelihood_base)):.6f}")
+    log(f"Base wake max           : {wake_analysis['base_max']:.6f}")
+    log(f"Base wake mean          : {wake_analysis['base_mean']:.6e}")
+    log(f"Refined wake max        : {wake_analysis['refined_max']:.6f}")
+    log(f"Refined wake mean       : {wake_analysis['refined_mean']:.6e}")
+    log(f"Recursive Euler eddies  : {wake_analysis['eddy_count']}")
+    log(f"Wake importance score   : {wake_analysis['importance_score']:.3f} ({wake_analysis['decision']})")
+    if USE_DNS_LIKE_MODE:
+        log("Wake likelihood use      : diagnostic/refinement map only; does not modify nu_t")
+
+    nx, ny, nz = len(xg), len(yg), len(zg)
+
+    u = np.ones((nx, ny, nz), dtype=np.float64) * U_INF
+    v = np.zeros_like(u)
+    w = np.zeros_like(u)
+    p = np.zeros_like(u)
+
+    nu_t = np.zeros_like(u)
+    wall_dist = compute_wall_distance(body, hmin)
+
+    u, v, w, p = apply_boundary_conditions(u, v, w, p, body)
+
+    dns_init_metrics = {
+        "enabled": False, "eddy_count_used": 0, "epsilon_fraction": 0.0,
+        "max_du": 0.0, "max_dv": 0.0, "max_dw": 0.0,
+        "l2_before_projection": 0.0, "div_before_projection": 0.0, "div_after_projection": 0.0, "note": "not DNS-like mode"
+    }
+
+    if USE_DNS_LIKE_MODE:
+        u, v, w, dns_init_metrics = apply_recursive_euler_dns_initial_perturbation(
+            u, v, w, recursive_wake_eddies, xg, yg, zg, body
+        )
+        u, v, w, p = apply_boundary_conditions(u, v, w, p, body)
+
+        if DNS_PROJECT_INITIAL_PERTURBATION and dns_init_metrics.get("enabled", False):
+            div0 = divergence(u, v, w, xg, yg, zg)
+            dns_init_metrics["div_before_projection"] = float(np.sqrt(np.mean(div0[~body] ** 2)))
+            speed0 = np.sqrt(u*u + v*v + w*w)
+            umax0 = max(float(np.max(speed0)), 1.0e-9)
+            dt0 = min(CFG["cfl_target"] * hmin / umax0, 1.0e-4)
+            rhs0 = RHO / max(dt0, 1.0e-30) * div0
+            rhs0[body] = 0.0
+            p = pressure_poisson_nonuniform(p, rhs0, xg, yg, zg, max(20, CFG["poisson_iters"] // 2))
+            u = u - dt0 / RHO * dd_axis(p, xg, 0)
+            v = v - dt0 / RHO * dd_axis(p, yg, 1)
+            w = w - dt0 / RHO * dd_axis(p, zg, 2)
+            u, v, w, p = apply_boundary_conditions(u, v, w, p, body)
+            div1 = divergence(u, v, w, xg, yg, zg)
+            dns_init_metrics["div_after_projection"] = float(np.sqrt(np.mean(div1[~body] ** 2)))
+
+        log("")
+        log("=== DNS-LIKE INITIAL PERTURBATION ===")
+        log(f"Euler perturbation enabled : {dns_init_metrics['enabled']}")
+        log(f"Eddies used               : {dns_init_metrics['eddy_count_used']}")
+        log(f"epsilon * U_inf           : {dns_init_metrics['epsilon_fraction']:.6e}")
+        log(f"max |du,dv,dw|            : {dns_init_metrics['max_du']:.3e}, {dns_init_metrics['max_dv']:.3e}, {dns_init_metrics['max_dw']:.3e} m/s")
+        log(f"div before/after project  : {dns_init_metrics.get('div_before_projection', 0.0):.3e} / {dns_init_metrics.get('div_after_projection', 0.0):.3e}")
+
+    write_dns_like_analysis_txt(DNS_LIKE_ANALYSIS_TXT, dns_init_metrics, wake_analysis)
+
+    history = []
+
+    with open(HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "step", "time", "dt", "cfl",
+            "div_l2",
+            "CD_wake",
+            "CD_geo_p", "CS_geo_p", "CL_geo_p",
+            "u_mean", "u_max",
+            "nu_t_mean", "nu_t_max",
+            "wake_mean", "wake_max",
+            "wake_active_fraction",
+            "wake_refinement_delta_mean",
+            "wake_importance_score",
+            "CD_morphed_p", "CS_morphed_p", "CL_morphed_p",
+            "delta_CD_morph_minus_base", "delta_CS_morph_minus_base", "delta_CL_morph_minus_base"
+        ])
+
+    sim_time = 0.0
+
+    for step in range(1, CFG["num_steps"] + 1):
+        speed = np.sqrt(u*u + v*v + w*w)
+        umax = max(float(np.max(speed)), 1.0e-9)
+
+        dt = CFG["cfl_target"] * hmin / umax
+        dt = min(dt, 1.0e-4)
+        cfl = umax * dt / hmin
+
+        if USE_DNS_LIKE_MODE:
+            # DNS-like mode: no modeled eddy viscosity and no wake-likelihood
+            # viscosity correction. Only molecular viscosity is used.
+            nu_t.fill(0.0)
+            nu_eff = NU
+        else:
+            S = strain_magnitude(u, v, w, xg, yg, zg)
+            lm = np.minimum(KAPPA * wall_dist, MIXING_LIMIT)
+            nu_t_new = np.minimum(lm * lm * S, NU_T_MAX)
+
+            if GEODESIC_WAKE_REDUCE_NUT:
+                nu_t_new *= (1.0 - GEODESIC_WAKE_NUT_REDUCTION * wake_likelihood)
+                nu_t_new = np.maximum(nu_t_new, 0.0)
+
+            nu_t = (1.0 - NU_T_RELAX) * nu_t + NU_T_RELAX * nu_t_new
+            nu_eff = NU + nu_t
+
+        if USE_TVD_HYPERBOLIC_ADVECTION:
+            conv_u = (
+                tvd_flux_derivative(u, u, xg, 0)
+                + tvd_flux_derivative(u, v, yg, 1)
+                + tvd_flux_derivative(u, w, zg, 2)
+            )
+            conv_v = (
+                tvd_flux_derivative(v, u, xg, 0)
+                + tvd_flux_derivative(v, v, yg, 1)
+                + tvd_flux_derivative(v, w, zg, 2)
+            )
+            conv_w = (
+                tvd_flux_derivative(w, u, xg, 0)
+                + tvd_flux_derivative(w, v, yg, 1)
+                + tvd_flux_derivative(w, w, zg, 2)
+            )
+        else:
+            du_dx = upwind_deriv(u, u, xg, 0)
+            du_dy = upwind_deriv(u, v, yg, 1)
+            du_dz = upwind_deriv(u, w, zg, 2)
+
+            dv_dx = upwind_deriv(v, u, xg, 0)
+            dv_dy = upwind_deriv(v, v, yg, 1)
+            dv_dz = upwind_deriv(v, w, zg, 2)
+
+            dw_dx = upwind_deriv(w, u, xg, 0)
+            dw_dy = upwind_deriv(w, v, yg, 1)
+            dw_dz = upwind_deriv(w, w, zg, 2)
+
+            conv_u = u * du_dx + v * du_dy + w * du_dz
+            conv_v = u * dv_dx + v * dv_dy + w * dv_dz
+            conv_w = u * dw_dx + v * dw_dy + w * dw_dz
+
+        u_star = u + dt * (-conv_u + nu_eff * laplacian(u, xg, yg, zg))
+        v_star = v + dt * (-conv_v + nu_eff * laplacian(v, xg, yg, zg))
+        w_star = w + dt * (-conv_w + nu_eff * laplacian(w, xg, yg, zg))
+
+        u_star[body] = 0.0
+        v_star[body] = 0.0
+        w_star[body] = 0.0
+
+        u_star, v_star, w_star, p = apply_boundary_conditions(u_star, v_star, w_star, p, body)
+
+        div_star = divergence(u_star, v_star, w_star, xg, yg, zg)
+        rhs = RHO / max(dt, 1.0e-30) * div_star
+        rhs[body] = 0.0
+
+        p = pseudo_compressibility_preconditioner(p, div_star, dt, body)
+        p = pressure_poisson_nonuniform(p, rhs, xg, yg, zg, CFG["poisson_iters"])
+
+        dpdx = dd_axis(p, xg, 0)
+        dpdy = dd_axis(p, yg, 1)
+        dpdz = dd_axis(p, zg, 2)
+
+        u = u_star - dt / RHO * dpdx
+        v = v_star - dt / RHO * dpdy
+        w = w_star - dt / RHO * dpdz
+
+        u, v, w, p = apply_boundary_conditions(u, v, w, p, body)
+
+        sim_time += dt
+
+        div_now = divergence(u, v, w, xg, yg, zg)
+        div_l2 = float(np.sqrt(np.mean(div_now[~body] ** 2)))
+
+        CD_wake = wake_momentum_cd(u, xg, yg, zg, BODY_X1)
+
+        if USE_GEODESIC_PRESSURE_FORCE and geo_boundary is not None:
+            CD_geo_p, CS_geo_p, CL_geo_p, F_geo_p = geodesic_pressure_force_coefficients(
+                p_gauge=p,
+                geo=geo_boundary,
+                xg=xg,
+                yg=yg,
+                zg=zg,
+                rho=RHO,
+                U_inf=U_INF,
+                A_ref=A_REF
+            )
+        else:
+            CD_geo_p, CS_geo_p, CL_geo_p = 0.0, 0.0, 0.0
+
+        if USE_MORPHED_PRESSURE_SENSITIVITY and morphed_boundary is not None:
+            CD_morph_p, CS_morph_p, CL_morph_p, F_morph_p = geodesic_pressure_force_coefficients(
+                p_gauge=p,
+                geo=morphed_boundary,
+                xg=xg,
+                yg=yg,
+                zg=zg,
+                rho=RHO,
+                U_inf=U_INF,
+                A_ref=A_REF
+            )
+            dCD_morph = CD_morph_p - CD_geo_p
+            dCS_morph = CS_morph_p - CS_geo_p
+            dCL_morph = CL_morph_p - CL_geo_p
+        else:
+            CD_morph_p, CS_morph_p, CL_morph_p = 0.0, 0.0, 0.0
+            dCD_morph, dCS_morph, dCL_morph = 0.0, 0.0, 0.0
+
+        u_mean = float(np.mean(u[~body]))
+        u_max = float(np.max(np.sqrt(u*u + v*v + w*w)))
+        nut_mean = float(np.mean(nu_t[~body]))
+        nut_max = float(np.max(nu_t))
+
+        row = [
+            step, sim_time, dt, cfl,
+            div_l2,
+            CD_wake,
+            CD_geo_p, CS_geo_p, CL_geo_p,
+            u_mean, u_max,
+            nut_mean, nut_max,
+            float(np.mean(wake_likelihood)),
+            float(np.max(wake_likelihood)),
+            float(wake_analysis["refined_active_fraction"]),
+            float(wake_analysis["delta_mean"]),
+            float(wake_analysis["importance_score"]),
+            CD_morph_p, CS_morph_p, CL_morph_p,
+            dCD_morph, dCS_morph, dCL_morph,
+        ]
+
+        history.append(row)
+
+        with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if step == 1 or step % CFG["log_every"] == 0 or step == CFG["num_steps"]:
+            log(
+                f"step={step:5d} "
+                f"t={sim_time:.6e} "
+                f"dt={dt:.3e} "
+                f"CFL={cfl:.3f} "
+                f"divL2={div_l2:.4e} "
+                f"CDwake={CD_wake:.5f} "
+                f"CDgeoP={CD_geo_p:.5f} "
+                f"CDmorphP={CD_morph_p:.5f} "
+                f"dCDmorph={dCD_morph:+.3e} "
+                f"CLgeoP={CL_geo_p:.5f} "
+                f"nutMean={nut_mean:.3e}"
+            )
+
+    history = np.asarray(history, dtype=float)
+
+    avg_start = int(0.65 * len(history))
+    tail = history[avg_start:]
+
+    CD_wake_avg = float(np.mean(tail[:, 5]))
+    CD_wake_std = float(np.std(tail[:, 5]))
+
+    CD_geo_avg = float(np.mean(tail[:, 6]))
+    CS_geo_avg = float(np.mean(tail[:, 7]))
+    CL_geo_avg = float(np.mean(tail[:, 8]))
+    CD_morph_avg = float(np.mean(tail[:, 18])) if history.shape[1] > 18 else 0.0
+    CS_morph_avg = float(np.mean(tail[:, 19])) if history.shape[1] > 19 else 0.0
+    CL_morph_avg = float(np.mean(tail[:, 20])) if history.shape[1] > 20 else 0.0
+    dCD_morph_avg = float(np.mean(tail[:, 21])) if history.shape[1] > 21 else 0.0
+    dCS_morph_avg = float(np.mean(tail[:, 22])) if history.shape[1] > 22 else 0.0
+    dCL_morph_avg = float(np.mean(tail[:, 23])) if history.shape[1] > 23 else 0.0
+
+    wall_runtime = time.time() - start_wall
+
+    np.savez_compressed(
+        FIELDS_NPZ,
+        xg=xg, yg=yg, zg=zg,
+        u=u, v=v, w=w, p=p,
+        nu_t=nu_t,
+        body=body,
+        boundary_likelihood=boundary_likelihood,
+        corner_likelihood=corner_likelihood,
+        wake_likelihood_base=wake_likelihood_base,
+        wake_likelihood=wake_likelihood,
+        morphed_boundary_likelihood=morphed_boundary_likelihood,
+        morphed_corner_likelihood=morphed_corner_likelihood,
+        morphed_wake_likelihood_base=morphed_wake_likelihood_base,
+        morphed_shell_enabled=np.asarray([int(morphed_metrics.get("enabled", False))], dtype=np.int32),
+        morphed_shell_alpha_mean=np.asarray([morphed_metrics.get("alpha_mean", 0.0)], dtype=np.float64),
+        morphed_shell_alpha_max=np.asarray([morphed_metrics.get("alpha_max", 0.0)], dtype=np.float64),
+        morphed_shell_volume=np.asarray([morphed_metrics.get("shell_volume_first_order", 0.0)], dtype=np.float64),
+        morphed_shell_area_change_fraction=np.asarray([morphed_metrics.get("area_change_fraction", 0.0)], dtype=np.float64),
+        recursive_euler_wake_eddy_count=np.asarray([wake_analysis["eddy_count"]], dtype=np.int32),
+        recursive_euler_wake_importance=np.asarray([wake_analysis["importance_score"]], dtype=np.float64),
+        dns_like_mode=np.asarray([int(USE_DNS_LIKE_MODE)], dtype=np.int32),
+        dns_like_re_l=np.asarray([RE_L], dtype=np.float64),
+        dns_init_eddy_count=np.asarray([dns_init_metrics.get("eddy_count_used", 0)], dtype=np.int32),
+        dns_init_max_du=np.asarray([dns_init_metrics.get("max_du", 0.0)], dtype=np.float64),
+        dns_init_max_dv=np.asarray([dns_init_metrics.get("max_dv", 0.0)], dtype=np.float64),
+        dns_init_max_dw=np.asarray([dns_init_metrics.get("max_dw", 0.0)], dtype=np.float64),
+        dns_init_div_before=np.asarray([dns_init_metrics.get("div_before_projection", 0.0)], dtype=np.float64),
+        dns_init_div_after=np.asarray([dns_init_metrics.get("div_after_projection", 0.0)], dtype=np.float64),
+    )
+
+    write_readable_3d_history(history)
+    make_force_readable_plot(history)
+    make_plots(history, xg, yg, zg, u, v, w, p, nu_t, body, wake_likelihood)
+
+    summary = []
+    summary.append("=== AHMED GEODESIC HYPERBOLIC SECTIONAL CFD SUMMARY ===")
+    summary.append(f"Run mode                    : {RUN_MODE}")
+    summary.append(f"Geometry source             : {geometry_source}")
+    summary.append(f"Grid                        : {nx} x {ny} x {nz} = {nx*ny*nz}")
+    summary.append(f"Grid type                   : {'tanh/sech2 clustered nonuniform' if USE_HYPERBOLIC_TANH_GRID else 'uniform'}")
+    summary.append(f"Advection                   : {'conservative TVD MUSCL ' + TVD_LIMITER if USE_TVD_HYPERBOLIC_ADVECTION else 'first-order upwind'}")
+    summary.append(f"Steps                       : {CFG['num_steps']}")
+    summary.append(f"Poisson iterations/step      : {CFG['poisson_iters']}")
+    summary.append(f"Wall runtime                : {wall_runtime:.3f} s = {wall_runtime/60.0:.3f} min")
+    summary.append(f"Live console file           : {LIVE_CONSOLE_PATH}")
+    summary.append("")
+    summary.append("=== PHYSICS ===")
+    summary.append(f"U_inf                       : {U_INF:.6f} m/s")
+    summary.append(f"rho                         : {RHO:.6f} kg/m^3")
+    summary.append(f"mu                          : {MU:.9e} Pa s")
+    summary.append(f"nu                          : {NU:.9e} m^2/s")
+    summary.append(f"Re_L                        : {RE_L:.6e}")
+    summary.append(f"q_inf                       : {Q_INF:.6f} Pa")
+    summary.append(f"A_ref                       : {A_REF:.9e} m^2")
+    summary.append("")
+    summary.append("=== REAL-RE TURBULENCE MODE ===")
+    summary.append(f"DNS-like mode               : {USE_DNS_LIKE_MODE}")
+    summary.append(f"Target real Re_L            : {TARGET_RE_L:.9e}")
+    summary.append(f"Active/Recomputed Re_L      : {RE_L:.9e}")
+    summary.append(f"Real-physics mu             : {MU:.9e} Pa s")
+    summary.append(f"Real-physics nu             : {NU:.9e} m^2/s")
+    summary.append(f"nu_t closure                : {'OFF / nu_t = 0' if USE_DNS_LIKE_MODE else 'ON / RANS-DDES style'}")
+    summary.append(f"Wake modifies nu_t          : {GEODESIC_WAKE_REDUCE_NUT}")
+    summary.append(f"Initial Euler perturbation  : {dns_init_metrics.get('enabled', False)}")
+    summary.append(f"Euler eddies used for init  : {dns_init_metrics.get('eddy_count_used', 0)}")
+    summary.append(f"Max init |du,dv,dw|         : {dns_init_metrics.get('max_du', 0.0):.9e} / {dns_init_metrics.get('max_dv', 0.0):.9e} / {dns_init_metrics.get('max_dw', 0.0):.9e} m/s")
+    summary.append(f"Init div before/after proj  : {dns_init_metrics.get('div_before_projection', 0.0):.9e} / {dns_init_metrics.get('div_after_projection', 0.0):.9e}")
+    summary.append(f"Real-physics analysis TXT       : {DNS_LIKE_ANALYSIS_TXT}")
+    summary.append("")
+    summary.append("=== SECTIONAL / VOXEL GEOMETRY ===")
+    summary.append(f"Sectional volume            : {sec['volume']:.9e} m^3")
+    summary.append(f"Sectional xcg               : {sec['xcg']:.9e} m")
+    summary.append(f"Sectional ycg               : {sec['ycg']:.9e} m")
+    summary.append(f"Sectional zcg               : {sec['zcg']:.9e} m")
+    summary.append(f"Voxel cells                 : {vox['cells']}")
+    summary.append(f"Voxel volume                : {vox['volume']:.9e} m^3")
+    summary.append(f"Voxel-volume error          : {vol_error:+.6f} %")
+    summary.append("")
+    summary.append("=== HYPERBOLIC GRID / TRANSPORT ===")
+    summary.append(f"Minimum grid spacing        : {hmin:.9e} m")
+    summary.append(f"x spacing min/max           : {np.min(np.diff(xg)):.9e} / {np.max(np.diff(xg)):.9e} m")
+    summary.append(f"y spacing min/max           : {np.min(np.diff(yg)):.9e} / {np.max(np.diff(yg)):.9e} m")
+    summary.append(f"z spacing min/max           : {np.min(np.diff(zg)):.9e} / {np.max(np.diff(zg)):.9e} m")
+    summary.append(f"TVD limiter                 : {TVD_LIMITER}")
+    summary.append(f"Pseudo-compressibility hook : {USE_PSEUDO_COMPRESSIBILITY_PRECONDITIONER}")
+    summary.append("")
+    summary.append("=== GEODESIC BOUNDARY ===")
+    if geo_boundary is not None:
+        summary.append(f"Boundary triangles          : {len(geo_boundary['area'])}")
+        summary.append(f"Geodesic sectional volume   : {geo_boundary['volume']:.9e} m^3")
+        summary.append(f"Surface triangle area sum   : {np.sum(geo_boundary['area']):.9e} m^2")
+        summary.append(f"Max corner weight           : {np.max(geo_boundary['corner_weight']):.6f}")
+        summary.append(f"Max wake seed               : {np.max(geo_boundary['wake_seed']):.6f}")
+    summary.append("")
+    summary.append("=== NORMAL-DRIVEN MORPHED SWEPT SHELL ===")
+    summary.append(f"Enabled                     : {morphed_metrics.get('enabled', False)}")
+    summary.append("Formula                     : q_tilde = q + alpha_j N_j")
+    summary.append(f"First-order Delta V         : {morphed_metrics.get('shell_volume_first_order', 0.0):.9e} m^3")
+    summary.append(f"Morphed volume estimate     : {morphed_metrics.get('morphed_volume_first_order', 0.0):.9e} m^3")
+    summary.append(f"Alpha mean/max              : {morphed_metrics.get('alpha_mean', 0.0):.9e} / {morphed_metrics.get('alpha_max', 0.0):.9e} m")
+    summary.append(f"Area change fraction        : {morphed_metrics.get('area_change_fraction', 0.0):.9e}")
+    summary.append(f"Morphed shell CSV           : {MORPHED_TRI_CSV}")
+    summary.append(f"Morphed analysis TXT        : {MORPHED_ANALYSIS_TXT}")
+    summary.append("")
+    summary.append("=== RECURSIVE EULER WAKE REFINEMENT ===")
+    summary.append(f"Euler identity              : exp(i theta) = cos(theta) + i sin(theta)")
+    summary.append(f"Enabled                     : {USE_RECURSIVE_EULER_WAKE_REFINEMENT}")
+    summary.append(f"Max recursion depth         : {EULER_WAKE_MAX_DEPTH}")
+    summary.append(f"Recursive eddies generated  : {wake_analysis['eddy_count']}")
+    summary.append(f"Base wake mean/max          : {wake_analysis['base_mean']:.9e} / {wake_analysis['base_max']:.9e}")
+    summary.append(f"Refined wake mean/max       : {wake_analysis['refined_mean']:.9e} / {wake_analysis['refined_max']:.9e}")
+    summary.append(f"Refinement delta mean/max   : {wake_analysis['delta_mean']:.9e} / {wake_analysis['delta_max']:.9e}")
+    summary.append(f"Refined active fraction     : {wake_analysis['refined_active_fraction']:.9e}")
+    summary.append(f"Mean/max nu_t reduction     : {wake_analysis['nut_reduction_mean']:.9e} / {wake_analysis['nut_reduction_max']:.9e}")
+    summary.append(f"Wake importance score       : {wake_analysis['importance_score']:.6f}")
+    summary.append(f"Wakefield likelihood decision: {wake_analysis['decision']}")
+    summary.append(f"Recursive eddy CSV          : {EULER_WAKE_EDDY_CSV}")
+    summary.append(f"Wake analysis TXT           : {EULER_WAKE_ANALYSIS_TXT}")
+    summary.append("")
+    summary.append("=== FINAL / TAIL FORCE COEFFICIENTS ===")
+    summary.append(f"Tail-average CD wake        : {CD_wake_avg:.9f}")
+    summary.append(f"Tail-std CD wake            : {CD_wake_std:.9f}")
+    summary.append(f"Tail-average CD geodesic P  : {CD_geo_avg:.9f}")
+    summary.append(f"Tail-average CS geodesic P  : {CS_geo_avg:.9f}")
+    summary.append(f"Tail-average CL geodesic P  : {CL_geo_avg:.9f}")
+    summary.append(f"Tail-average CD morphed P   : {CD_morph_avg:.9f}")
+    summary.append(f"Tail-average CS morphed P   : {CS_morph_avg:.9f}")
+    summary.append(f"Tail-average CL morphed P   : {CL_morph_avg:.9f}")
+    summary.append(f"Tail-average dCD morph-base : {dCD_morph_avg:+.9e}")
+    summary.append(f"Tail-average dCS morph-base : {dCS_morph_avg:+.9e}")
+    summary.append(f"Tail-average dCL morph-base : {dCL_morph_avg:+.9e}")
+    summary.append("")
+    summary.append("=== PLOT OUTPUTS ===")
+    summary.append(f"Readable force TXT          : {HISTORY_READABLE_TXT}")
+    summary.append(f"Readable force PNG          : {FORCE_READABLE_PNG}")
+    summary.append(f"Convergence PNG             : {CONV_PNG}")
+    summary.append(f"Field slices PNG            : {FIELD_PNG}")
+    summary.append(f"Streamline PNG              : {STREAMLINE_PNG}")
+    summary.append("")
+    summary.append("Interpretation:")
+    summary.append("  Hyperbolic/TVD advection should reduce numerical wake smearing compared with first-order transport.")
+    summary.append("  Tanh/sech2 clustering concentrates resolution near the front, rear, ground, side edges, and near wake.")
+    summary.append("  CD_wake is the wake-momentum drag diagnostic.")
+    summary.append("  Wakefield likelihood is important here when it materially changes nu_t in the separated rear/near-wake region.")
+    summary.append("  Recursive Euler eddies are diagnostic/initial perturbation features only; they are not a recurring force source.")
+    summary.append("  The script now uses real Re_L ~= 2.68e6; DNS is not claimed because the grid is far too coarse for DNS at this Reynolds number.")
+    summary.append("  CD_geodesic_P is the boundary-triangle pressure-drag diagnostic.")
+    summary.append("  CD_morphed_P and dCD_morph-base are normal-shell pressure-sensitivity diagnostics.")
+    summary.append("  The morphed shell is an attention/refinement/sensitivity layer, not a new physical wall.")
+    summary.append("  Do not replace benchmark CD with geodesic pressure CD until validated.")
+    summary.append("  Compare both histories against OpenFOAM/Fluent/benchmark data.")
+    summary.append("================================================")
+
+    SUMMARY_TXT.write_text("\n".join(summary), encoding="utf-8")
+    log("")
+    log("\n".join(summary))
+
+
+# ============================================================
+# 13. PLOTS
+# ============================================================
+
+def resample_field_2d_to_uniform(field2d, axis_a, axis_b, a_new, b_new):
+    """
+    Bilinear interpolation from a nonuniform tensor grid to a uniform grid.
+
+    Matplotlib streamplot works best on uniformly spaced axes, while this solver
+    uses tanh/sech2 nonuniform clustering. This helper keeps the solver grid
+    unchanged and only resamples visualization slices.
+
+    field2d shape must be (len(axis_a), len(axis_b)).
+    """
+    field2d = np.asarray(field2d, dtype=float)
+    tmp = np.empty((len(a_new), len(axis_b)), dtype=float)
+
+    for j in range(len(axis_b)):
+        tmp[:, j] = np.interp(a_new, axis_a, field2d[:, j])
+
+    out = np.empty((len(a_new), len(b_new)), dtype=float)
+    for i in range(len(a_new)):
+        out[i, :] = np.interp(b_new, axis_b, tmp[i, :])
+
+    return out
+
+
+def make_streamline_plot(xg, yg, zg, u, v, w, body, wake_likelihood):
+    """
+    Save a dedicated streamline visualization.
+
+    Panel 1: side-view x-z streamlines at y = 0.
+    Panel 2: top-view x-y streamlines at z near mid body height.
+
+    This is a visualization/diagnostic plot. It does not alter the CFD solve.
+    """
+    nxp = min(240, max(90, len(xg) * 2))
+    nyp = min(160, max(70, len(yg) * 2))
+    nzp = min(150, max(70, len(zg) * 2))
+
+    xu = np.linspace(float(xg[0]), float(xg[-1]), nxp)
+    yu = np.linspace(float(yg[0]), float(yg[-1]), nyp)
+    zu = np.linspace(float(zg[0]), float(zg[-1]), nzp)
+
+    iy = int(np.argmin(np.abs(yg - 0.0)))
+    iz_mid = int(np.argmin(np.abs(zg - 0.50 * BODY_H)))
+
+    # Side view: x-z at centerline y.
+    Uxz = resample_field_2d_to_uniform(u[:, iy, :], xg, zg, xu, zu)
+    Wxz = resample_field_2d_to_uniform(w[:, iy, :], xg, zg, xu, zu)
+    Bxz = resample_field_2d_to_uniform(body[:, iy, :].astype(float), xg, zg, xu, zu)
+    WLik_xz = resample_field_2d_to_uniform(wake_likelihood[:, iy, :], xg, zg, xu, zu)
+    speed_xz = np.sqrt(Uxz * Uxz + Wxz * Wxz)
+
+    mask_xz = Bxz > 0.45
+    Uxz_m = np.ma.array(Uxz.T, mask=mask_xz.T)
+    Wxz_m = np.ma.array(Wxz.T, mask=mask_xz.T)
+    speed_xz_m = np.ma.array(speed_xz.T, mask=mask_xz.T)
+
+    # Top view: x-y at mid body height.
+    Uxy = resample_field_2d_to_uniform(u[:, :, iz_mid], xg, yg, xu, yu)
+    Vxy = resample_field_2d_to_uniform(v[:, :, iz_mid], xg, yg, xu, yu)
+    Bxy = resample_field_2d_to_uniform(body[:, :, iz_mid].astype(float), xg, yg, xu, yu)
+    WLik_xy = resample_field_2d_to_uniform(wake_likelihood[:, :, iz_mid], xg, yg, xu, yu)
+    speed_xy = np.sqrt(Uxy * Uxy + Vxy * Vxy)
+
+    mask_xy = Bxy > 0.45
+    Uxy_m = np.ma.array(Uxy.T, mask=mask_xy.T)
+    Vxy_m = np.ma.array(Vxy.T, mask=mask_xy.T)
+    speed_xy_m = np.ma.array(speed_xy.T, mask=mask_xy.T)
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+    ax = axes[0]
+    cf0 = ax.contourf(xu, zu, WLik_xz.T, levels=32, alpha=0.68)
+    ax.streamplot(xu, zu, Uxz_m, Wxz_m, color=speed_xz_m, density=1.45, linewidth=0.65, arrowsize=0.75)
+    ax.contour(xu, zu, Bxz.T, levels=[0.5], colors="k", linewidths=1.2)
+    ax.axvline(BODY_X1, color="k", linewidth=0.8, linestyle="--", alpha=0.55)
+    ax.set_title("Side-view streamlines at y = 0, colored by speed over wake likelihood")
+    ax.set_xlabel("x / streamwise coordinate")
+    ax.set_ylabel("z / height")
+    ax.set_xlim(float(xg[0]), float(xg[-1]))
+    ax.set_ylim(float(zg[0]), float(min(zg[-1], max(1.05 * BODY_H, 0.60))))
+    fig.colorbar(cf0, ax=ax, label="wake likelihood")
+
+    ax = axes[1]
+    cf1 = ax.contourf(xu, yu, WLik_xy.T, levels=32, alpha=0.68)
+    ax.streamplot(xu, yu, Uxy_m, Vxy_m, color=speed_xy_m, density=1.45, linewidth=0.65, arrowsize=0.75)
+    ax.contour(xu, yu, Bxy.T, levels=[0.5], colors="k", linewidths=1.2)
+    ax.axvline(BODY_X1, color="k", linewidth=0.8, linestyle="--", alpha=0.55)
+    ax.set_title(f"Top-view streamlines at z = {float(zg[iz_mid]):.4f} m")
+    ax.set_xlabel("x / streamwise coordinate")
+    ax.set_ylabel("y / lateral coordinate")
+    ax.set_xlim(float(xg[0]), float(xg[-1]))
+    ax.set_ylim(-0.85 * BODY_W, 0.85 * BODY_W)
+    fig.colorbar(cf1, ax=ax, label="wake likelihood")
+
+    fig.suptitle("DNS-like Ahmed-body streamline diagnostics", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(STREAMLINE_PNG, dpi=180)
+    plt.close(fig)
+
+
+def write_readable_3d_history(history):
+    """Write a readable force-history table for the 3D solver."""
+    if history is None or len(history) == 0:
+        return
+    h = np.asarray(history, dtype=float)
+    tail = h[int(0.65 * len(h)):]
+    lines = []
+    lines.append("Ahmed 3D OBJ-only CD/CL force history")
+    lines.append("=======================================")
+    lines.append("")
+    lines.append(f"Run mode                 : {RUN_MODE}")
+    lines.append(f"Rows                     : {len(h)}")
+    lines.append(f"History CSV              : {HISTORY_CSV}")
+    lines.append(f"Tail-average CD_wake     : {np.mean(tail[:,5]):.9f}")
+    lines.append(f"Tail-average CD_geoP     : {np.mean(tail[:,6]):.9f}")
+    lines.append(f"Tail-average CL_geoP     : {np.mean(tail[:,8]):.9f}")
+    lines.append(f"Tail-average div_l2      : {np.mean(tail[:,4]):.9e}")
+    lines.append("")
+    lines.append("Important: CD_geoP/CL_geoP are signed pressure-force diagnostics from the geodesic boundary triangles.")
+    lines.append("CD_wake is a wake-momentum drag diagnostic. Use the 3D workstation mode or OpenFOAM/SU2 for validation.")
+    lines.append("")
+    header = f"{'step':>7s} {'time':>12s} {'dt':>10s} {'CFL':>7s} {'div_l2':>12s} {'CD_wake':>10s} {'CD_geoP':>10s} {'CL_geoP':>10s} {'u_max':>10s}"
+    lines.append(header)
+    lines.append('-' * len(header))
+    # first 20, middle marker, last 20
+    idxs = list(range(min(20, len(h))))
+    if len(h) > 45:
+        idxs += [-1]
+    idxs += list(range(max(20, len(h)-20), len(h)))
+    seen = set()
+    for idx in idxs:
+        if idx == -1:
+            lines.append("   ... rows omitted; see CSV for every step ...")
+            continue
+        if idx in seen or idx < 0 or idx >= len(h):
+            continue
+        seen.add(idx)
+        r = h[idx]
+        lines.append(f"{int(r[0]):7d} {r[1]:12.5e} {r[2]:10.3e} {r[3]:7.3f} {r[4]:12.4e} {r[5]:10.5f} {r[6]:10.5f} {r[8]:10.5f} {r[10]:10.4f}")
+    HISTORY_READABLE_TXT.write_text("\n".join(lines), encoding="utf-8")
+
+
+def make_force_readable_plot(history):
+    """Single clean CD/CL plot for the 3D solver."""
+    if history is None or len(history) == 0:
+        return
+    h = np.asarray(history, dtype=float)
+    steps = h[:, 0]
+    plt.figure(figsize=(11, 6))
+    plt.plot(steps, h[:,5], label="CD wake-momentum", linewidth=2.0)
+    plt.plot(steps, h[:,6], label="CD geodesic pressure", linewidth=2.0)
+    plt.plot(steps, h[:,8], label="CL geodesic pressure", linewidth=2.0)
+    plt.axhspan(0.285, 0.315, alpha=0.10, label="Typical CD benchmark band")
+    plt.xlabel("Solver step")
+    plt.ylabel("Coefficient")
+    plt.title("3D OBJ Ahmed-body force history")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(FORCE_READABLE_PNG, dpi=190)
+    plt.close()
+
+
+def make_plots(history, xg, yg, zg, u, v, w, p, nu_t, body, wake_likelihood):
+    if history is None or len(history) == 0:
+        return
+
+    steps = history[:, 0]
+    div_l2 = history[:, 4]
+    cd_wake = history[:, 5]
+    cd_geo = history[:, 6]
+    cl_geo = history[:, 8]
+    cfl = history[:, 3]
+    nut_mean = history[:, 11]
+
+    plt.figure(figsize=(12, 8))
+
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.plot(steps, div_l2)
+    ax1.set_title("Divergence residual")
+    ax1.set_xlabel("step")
+    ax1.set_ylabel("L2 div")
+
+    ax2 = plt.subplot(2, 2, 2)
+    ax2.plot(steps, cd_wake, label="CD wake")
+    ax2.plot(steps, cd_geo, label="CD geodesic pressure")
+    ax2.plot(steps, cl_geo, label="CL geodesic pressure")
+    ax2.set_title("Force coefficients")
+    ax2.set_xlabel("step")
+    ax2.legend()
+
+    ax3 = plt.subplot(2, 2, 3)
+    ax3.plot(steps, cfl)
+    ax3.set_title("CFL")
+    ax3.set_xlabel("step")
+
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.plot(steps, nut_mean)
+    ax4.set_title("Mean eddy viscosity")
+    ax4.set_xlabel("step")
+
+    plt.tight_layout()
+    plt.savefig(CONV_PNG, dpi=180)
+    plt.close()
+
+    iy = len(yg) // 2
+    speed = np.sqrt(u*u + v*v + w*w)
+    cp = p / max(Q_INF, 1.0e-30)
+
+    X, Z = np.meshgrid(xg, zg, indexing="ij")
+
+    plt.figure(figsize=(14, 10))
+
+    ax1 = plt.subplot(2, 2, 1)
+    im1 = ax1.contourf(X, Z, speed[:, iy, :], levels=40)
+    ax1.contour(X, Z, body[:, iy, :], levels=[0.5], colors="k", linewidths=1.0)
+    ax1.set_title("Midspan speed")
+    ax1.set_xlabel("x")
+    ax1.set_ylabel("z")
+    plt.colorbar(im1, ax=ax1)
+
+    ax2 = plt.subplot(2, 2, 2)
+    im2 = ax2.contourf(X, Z, cp[:, iy, :], levels=40)
+    ax2.contour(X, Z, body[:, iy, :], levels=[0.5], colors="k", linewidths=1.0)
+    ax2.set_title("Midspan Cp")
+    ax2.set_xlabel("x")
+    ax2.set_ylabel("z")
+    plt.colorbar(im2, ax=ax2)
+
+    ax3 = plt.subplot(2, 2, 3)
+    im3 = ax3.contourf(X, Z, nu_t[:, iy, :], levels=40)
+    ax3.contour(X, Z, body[:, iy, :], levels=[0.5], colors="k", linewidths=1.0)
+    ax3.set_title("Midspan eddy viscosity")
+    ax3.set_xlabel("x")
+    ax3.set_ylabel("z")
+    plt.colorbar(im3, ax=ax3)
+
+    ax4 = plt.subplot(2, 2, 4)
+    im4 = ax4.contourf(X, Z, wake_likelihood[:, iy, :], levels=40)
+    ax4.contour(X, Z, body[:, iy, :], levels=[0.5], colors="k", linewidths=1.0)
+    ax4.set_title("Geodesic wake likelihood")
+    ax4.set_xlabel("x")
+    ax4.set_ylabel("z")
+    plt.colorbar(im4, ax=ax4)
+
+    plt.tight_layout()
+    plt.savefig(FIELD_PNG, dpi=180)
+    plt.close()
+
+    make_streamline_plot(xg, yg, zg, u, v, w, body, wake_likelihood)
+
+
+# ============================================================
+# 14. EXECUTE
+# ============================================================
+
+if __name__ == "__main__":
+    try:
+        run_solver()
+    except Exception:
+        log("\n=== RUN FAILED ===")
+        log(traceback.format_exc())
+        raise
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
